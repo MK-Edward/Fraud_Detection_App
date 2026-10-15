@@ -1,234 +1,630 @@
-from fastapi import FastAPI, HTTPException, Depends, status, Form, Response, Cookie
-from fastapi.responses import HTMLResponse, RedirectResponse
-from contextlib import asynccontextmanager
 
-from app.schemas import TransactionRequest
-from app.model_service import FraudDetectionService
+from contextlib import asynccontextmanager
+from html import escape
+
+from fastapi import (
+    FastAPI, Depends, Form, Cookie, HTTPException, status
+)
+from fastapi.responses import HTMLResponse, RedirectResponse
+
 from app.database import init_db, get_db_connection
-from app.auth import hash_password, verify_password, create_access_token, decode_access_token
+from app.auth import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    decode_access_token,
+)
+from app.model_service import FraudDetectionService
+
 
 fraud_service = None
+
+BOOTSTRAP = """
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+      rel="stylesheet">
+"""
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global fraud_service
+
+    init_db()
     try:
-        init_db()  # Automatically builds your database tables when the app turns on
-        fraud_service = FraudDetectionService()  # Loads your AI model files into memory
-        print("✅ Production stack active and ML instances loaded.")
-    except Exception as e:
-        print(f"❌ Startup Engine Error: {e}")
+        fraud_service = FraudDetectionService()
+        print("Fraud detection model loaded.")
+    except Exception as exc:
+        # The website can start, but transfers must fail safely.
+        fraud_service = None
+        print(f"Model loading failed: {exc}")
+
     yield
 
-app = FastAPI(title="AI Fraud Bank Hub", version="4.0.0", lifespan=lifespan)
 
-# Helper function to check if the browser has a valid login cookie
-def get_session_user(session_token: str = Cookie(None)):
+app = FastAPI(
+    title="AI Fraud Bank Hub",
+    version="4.0.0",
+    lifespan=lifespan,
+)
+
+
+# -------------------- HELPERS --------------------
+
+def get_session_user(
+    session_token: str | None = Cookie(default=None),
+):
     if not session_token:
         return None
-    return decode_access_token(session_token)
+
+    try:
+        return decode_access_token(session_token)
+    except Exception:
+        return None
 
 
-# --- 🚪 ROOM 1: THE PORTAL LANDING PAGE (Website Root '/') ---
-@app.get("/", response_class=HTMLResponse)
-async def home_portal(user: str = Depends(get_session_user)):
-    # If already logged in, automatically skip this page and route them to their workspace
-    if user:
-        conn = get_db_connection()
-        user_profile = conn.execute("SELECT role FROM users WHERE username = ?", (user,)).fetchone()
-        conn.close()
-        if user_profile and user_profile["role"] == "manager":
-            return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
-        return RedirectResponse(url="/portal", status_code=status.HTTP_303_SEE_OTHER)
-
-    # If not logged in, show this clean welcome page layout with entry buttons
-    return """
-    <!DOCTYPE html><html><head><title>Secure AI Bank Portal</title><link rel="stylesheet" href="https://jsdelivr.net"></head>
-    <body class="bg-dark text-white d-flex align-items-center justify-content-center" style="height: 100vh;">
-        <div class="card p-5 bg-secondary text-white text-center shadow-lg" style="max-width: 500px; width: 100%;">
-            <h1 class="mb-3">🛡️ AI Core Trust Bank</h1>
-            <p class="text-light mb-4">Integrated Real-Time Machine Learning Transaction Protection Network</p>
-            <div class="row g-3">
-                <div class="col-md-6"><a href="/ui/login" class="btn btn-primary w-100 p-3 fw-bold">Sign In Portal</a></div>
-                <div class="col-md-6"><a href="/ui/register" class="btn btn-warning w-100 p-3 fw-bold">Open Account</a></div>
-            </div>
-        </div>
-    </body></html>
-    """
+def page(content: str, title: str = "AI Fraud Bank Hub"):
+    return HTMLResponse(
+        f"""<!doctype html>
+        <html lang="en">
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>{escape(title)}</title>
+          {BOOTSTRAP}
+        </head>
+        <body class="bg-light">
+          <main class="container py-5">{content}</main>
+        </body>
+        </html>"""
+    )
 
 
-# --- 🔑 ROOM 2: ACCOUNT MANAGEMENT PAGES ---
-@app.get("/ui/register", response_class=HTMLResponse)
-async def view_register_form():
-    return """
-    <!DOCTYPE html><html><head><title>Create Account</title><link rel="stylesheet" href="https://jsdelivr.net"></head>
-    <body class="bg-light d-flex align-items-center justify-content-center" style="height: 100vh;">
-        <form action="/auth/register" method="post" class="bg-white p-5 rounded shadow" style="width:400px;">
-            <h3>📝 Register Account</h3><hr>
-            <div class="mb-3"><label>Username</label><input type="text" name="username" class="form-control" required></div>
-            <div class="mb-3"><label>Password</label><input type="password" name="password" class="form-control" required></div>
-            <div class="mb-3"><label>Account Profile Role</label><select name="role" class="form-select"><option value="customer">Retail Bank Customer User</option><option value="manager">System Dashboard Manager</option></select></div>
-            <button type="submit" class="btn btn-success w-100 mt-2">Complete Setup</button>
-            <a href="/" class="d-block text-center mt-3 text-secondary">Back to Gateway</a>
-        </form>
-    </body></html>
-    """
+def message_page(message: str, destination: str = "/portal"):
+    safe_message = (
+        message.replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace("\n", " ")
+    )
+    safe_destination = escape(destination, quote=True)
 
-@app.get("/ui/login", response_class=HTMLResponse)
-async def view_login_form():
-    return """
-    <!DOCTYPE html><html><head><title>Sign In</title><link rel="stylesheet" href="https://jsdelivr.net"></head>
-    <body class="bg-light d-flex align-items-center justify-content-center" style="height: 100vh;">
-        <form action="/auth/login" method="post" class="bg-white p-5 rounded shadow" style="width:400px;">
-            <h3>🔑 Account Authentication</h3><hr>
-            <div class="mb-3"><label>Username</label><input type="text" name="username" class="form-control" required></div>
-            <div class="mb-3"><label>Password</label><input type="password" name="password" class="form-control" required></div>
-            <button type="submit" class="btn btn-primary w-100 mt-2">Secure Login</button>
-            <a href="/" class="d-block text-center mt-3 text-secondary">Back to Gateway</a>
-        </form>
-    </body></html>
-    """
+    return HTMLResponse(
+        f"""<script>
+        alert('{safe_message}');
+        window.location.href = '{safe_destination}';
+        </script>"""
+    )
 
-@app.post("/auth/register")
-async def process_register(username: str = Form(...), password: str = Form(...), role: str = Form(...)):
+
+def current_role(username: str):
     conn = get_db_connection()
     try:
-        hashed = hash_password(password)
-        conn.execute("INSERT INTO users (username, hashed_password, role) VALUES (?, ?, ?)", (username, hashed, role))
-        conn.commit()
-        return HTMLResponse("<script>alert('Account Created! Please proceed to login.'); window.location.href='/ui/login';</script>")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Username taken.")
+        row = conn.execute(
+            "SELECT role FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+        return row["role"] if row else None
     finally:
         conn.close()
 
-@app.post("/auth/login")
-async def process_login(response: Response, username: str = Form(...), password: str = Form(...)):
+
+def require_manager(username: str | None):
+    if not username:
+        return RedirectResponse(
+            "/ui/login", status_code=status.HTTP_303_SEE_OTHER
+        )
+
+    if current_role(username) != "manager":
+        raise HTTPException(
+            status_code=403,
+            detail="Manager access required.",
+        )
+
+    return None
+
+
+# -------------------- HOME PAGE --------------------
+
+@app.get("/", response_class=HTMLResponse)
+async def home_portal(user: str | None = Depends(get_session_user)):
+    if user:
+        role = current_role(user)
+        if role == "manager":
+            return RedirectResponse("/dashboard", status_code=303)
+        if role == "customer":
+            return RedirectResponse("/portal", status_code=303)
+
+    return page("""
+      <div class="card shadow mx-auto p-5 text-center" style="max-width:600px">
+        <h1>🛡️ AI Core Trust Bank</h1>
+        <p class="text-muted">
+          Demonstration banking portal with machine-learning fraud scoring.
+        </p>
+        <a class="btn btn-primary mb-2" href="/ui/login">Sign in</a>
+        <a class="btn btn-warning" href="/ui/register">Create customer account</a>
+      </div>
+    """)
+
+
+# -------------------- REGISTRATION / LOGIN --------------------
+
+@app.get("/ui/register", response_class=HTMLResponse)
+async def view_register_form():
+    return page("""
+      <form action="/auth/register" method="post"
+            class="card shadow p-4 mx-auto" style="max-width:420px">
+        <h3>Create customer account</h3>
+        <label class="form-label mt-3">Username</label>
+        <input class="form-control" name="username"
+               minlength="3" maxlength="50" required>
+        <label class="form-label mt-3">Password</label>
+        <input class="form-control" type="password" name="password"
+               minlength="8" required>
+        <button class="btn btn-success mt-4">Register</button>
+        <a class="mt-3" href="/ui/login">Already registered? Sign in</a>
+      </form>
+    """, "Register")
+
+
+@app.get("/ui/login", response_class=HTMLResponse)
+async def view_login_form():
+    return page("""
+      <form action="/auth/login" method="post"
+            class="card shadow p-4 mx-auto" style="max-width:420px">
+        <h3>Sign in</h3>
+        <label class="form-label mt-3">Username</label>
+        <input class="form-control" name="username" required>
+        <label class="form-label mt-3">Password</label>
+        <input class="form-control" type="password" name="password" required>
+        <button class="btn btn-primary mt-4">Sign in</button>
+        <a class="mt-3" href="/ui/register">Create customer account</a>
+      </form>
+    """, "Sign in")
+
+
+@app.post("/auth/register")
+async def process_register(
+    username: str = Form(...),
+    password: str = Form(...),
+):
+    username = username.strip()
+
+    if len(username) < 3 or len(username) > 50 or len(password) < 8:
+        return message_page(
+            "Username must be 3-50 characters and password at least 8 characters.",
+            "/ui/register",
+        )
+
     conn = get_db_connection()
-    row = conn.execute("SELECT hashed_password, role FROM users WHERE username = ?", (username,)).fetchone()
-    conn.close()
+    try:
+        conn.execute(
+            """
+            INSERT INTO users (username, hashed_password, role, balance)
+            VALUES (?, ?, 'customer', 1000.00)
+            """,
+            (username, hash_password(password)),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        return message_page(
+            "Registration failed. The username may already exist.",
+            "/ui/register",
+        )
+    finally:
+        conn.close()
+
+    return message_page("Account created. Please sign in.", "/ui/login")
+
+
+@app.post("/auth/login")
+async def process_login(
+    username: str = Form(...),
+    password: str = Form(...),
+):
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT hashed_password, role
+            FROM users
+            WHERE username = ?
+            """,
+            (username.strip(),),
+        ).fetchone()
+    finally:
+        conn.close()
+
     if not row or not verify_password(password, row["hashed_password"]):
-        return HTMLResponse("<script>alert('Invalid Credentials!'); window.history.back();</script>")
-    
-    token = create_access_token(username)
-    target_url = "/dashboard" if row["role"] == "manager" else "/portal"
-    res = RedirectResponse(url=target_url, status_code=status.HTTP_303_SEE_OTHER)
-    res.set_cookie(key="session_token", value=token, httponly=True)  # Saves a tracking login cookie in the user's browser
-    return res
+        return message_page("Invalid username or password.", "/ui/login")
+
+    target = "/dashboard" if row["role"] == "manager" else "/portal"
+    response = RedirectResponse(target, status_code=303)
+    response.set_cookie(
+        key="session_token",
+        value=create_access_token(username.strip()),
+        httponly=True,
+        samesite="lax",
+        secure=False,  # Set True when deployed behind HTTPS.
+        max_age=60 * 60,
+    )
+    return response
+
 
 @app.get("/auth/logout")
-async def logout(response: Response):
-    res = RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
-    res.delete_cookie("session_token")
-    return res
+async def logout():
+    response = RedirectResponse("/", status_code=303)
+    response.delete_cookie("session_token")
+    return response
 
 
-# --- 💸 ROOM 3: THE CUSTOMER BANKING PORTAL (`/portal`) ---
+# -------------------- CUSTOMER BANKING PORTAL --------------------
+
 @app.get("/portal", response_class=HTMLResponse)
-async def customer_banking_portal(user: str = Depends(get_session_user)):
+async def customer_portal(user: str | None = Depends(get_session_user)):
     if not user:
-        return RedirectResponse(url="/ui/login")
-    
+        return RedirectResponse("/ui/login", status_code=303)
+
+    if current_role(user) != "customer":
+        raise HTTPException(status_code=403, detail="Customer access required.")
+
     conn = get_db_connection()
-    profile = conn.execute("SELECT balance FROM users WHERE username = ?", (user,)).fetchone()
-    ledger = conn.execute("SELECT * FROM transactions WHERE username = ? ORDER BY timestamp DESC LIMIT 5", (user,)).fetchall()
-    conn.close()
+    try:
+        profile = conn.execute(
+            "SELECT balance FROM users WHERE username = ?", (user,)
+        ).fetchone()
 
-    rows = "".join([f"<tr><td>{tx['timestamp']}</td><td>{tx['recipient']}</td><td>${tx['amount']:.2f}</td><td><span class='badge bg-{'success' if tx['fraud_prediction']==0 else 'danger'}'>{tx['decision']}</span></td></tr>" for tx in ledger])
+        transactions = conn.execute(
+            """
+            SELECT timestamp, recipient, amount, decision, fraud_prediction
+            FROM transactions
+            WHERE username = ?
+            ORDER BY timestamp DESC
+            LIMIT 10
+            """,
+            (user,),
+        ).fetchall()
+    finally:
+        conn.close()
 
-    return f"""
-    <!DOCTYPE html><html><head><title>My Banking Dashboard</title><link rel="stylesheet" href="https://jsdelivr.net"></head>
-    <body class="bg-light p-4"><div class="container bg-white p-5 rounded shadow" style="max-width:900px;">
-        <div class="d-flex justify-content-between align-items-center mb-4">
-            <h2>👋 Welcome Back, {user}!</h2><a href="/auth/logout" class="btn btn-outline-danger">Disconnect Session</a>
+    balance = float(profile["balance"]) if profile else 0.0
+    safe_user = escape(user)
+
+    transaction_rows = ""
+    for tx in transactions:
+        is_fraud = int(tx["fraud_prediction"]) == 1
+        badge = "danger" if is_fraud else "success"
+        transaction_rows += f"""
+          <tr>
+            <td>{escape(str(tx['timestamp']))}</td>
+            <td>{escape(str(tx['recipient']))}</td>
+            <td>${float(tx['amount']):.2f}</td>
+            <td><span class="badge bg-{badge}">
+              {escape(str(tx['decision']))}
+            </span></td>
+          </tr>
+        """
+
+    if not transaction_rows:
+        transaction_rows = (
+            '<tr><td colspan="4" class="text-center">No transactions yet.</td></tr>'
+        )
+
+    return page(f"""
+      <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2>Welcome, {safe_user}</h2>
+        <a href="/auth/logout" class="btn btn-outline-danger">Sign out</a>
+      </div>
+
+      <div class="alert alert-primary">
+        <h5>Demo account balance</h5>
+        <h2>${balance:.2f}</h2>
+      </div>
+
+      <div class="row g-4">
+        <div class="col-lg-5">
+          <div class="card shadow p-4">
+            <h4>Send a demo transfer</h4>
+            <p class="text-muted">
+              Transaction features below are demo inputs, not verified bank data.
+            </p>
+            <form action="/portal/transact" method="post">
+              <label class="form-label">Recipient username</label>
+              <input class="form-control mb-3" name="recipient" required>
+
+              <label class="form-label">Amount ($)</label>
+              <input class="form-control mb-3" type="number" min="0.01"
+                     step="0.01" name="amount" required>
+
+              <label class="form-label">Distance from home</label>
+              <input class="form-control mb-3" type="number" min="0"
+                     step="0.1" name="distance_from_home" value="12" required>
+
+              <label class="form-label">Distance from last transaction</label>
+              <input class="form-control mb-3" type="number" min="0"
+                     step="0.1" name="distance_from_last_transaction"
+                     value="1" required>
+
+              <label class="form-label">Price ratio to median</label>
+              <input class="form-control mb-3" type="number" min="0.001"
+                     step="0.1" name="ratio_to_median_purchase_price"
+                     value="1" required>
+
+              <label class="form-label">Repeat retailer (0 or 1)</label>
+              <select class="form-select mb-3" name="repeat_retailer">
+                <option value="1">Yes</option><option value="0">No</option>
+              </select>
+
+              <label class="form-label">Used chip (0 or 1)</label>
+              <select class="form-select mb-3" name="used_chip">
+                <option value="1">Yes</option><option value="0">No</option>
+              </select>
+
+              <label class="form-label">Used PIN (0 or 1)</label>
+              <select class="form-select mb-3" name="used_pin_number">
+                <option value="1">Yes</option><option value="0">No</option>
+              </select>
+
+              <label class="form-label">Online order (0 or 1)</label>
+              <select class="form-select mb-3" name="online_order">
+                <option value="0">No</option><option value="1">Yes</option>
+              </select>
+
+              <button class="btn btn-success w-100">Check and submit demo transfer</button>
+            </form>
+          </div>
         </div>
-        <div class="p-4 bg-primary text-white rounded mb-4"><h5>Current Account Net Balance</h5><h3>${profile['balance'] if profile else 0.00:.2f}</h3></div>
-        <div class="row g-4">
-            <div class="col-md-5">
-                <h4>💸 Send Funds Wire Transfer</h4><hr>
-                <form action="/portal/transact" method="post">
-                    <div class="mb-2"><label>Recipient Username</label><input type="text" name="recipient" class="form-control" required></div>
-                    <div class="mb-2"><label>Transfer Amount ($)</label><input type="number" step="0.01" name="amount" class="form-control" value="150" required></div>
-                    <div class="mb-2"><label>Distance From Home (km)</label><input type="number" step="0.1" name="distance_from_home" class="form-control" value="12" required></div>
-                    <div class="mb-2"><label>Distance From Last Swipe (km)</label><input type="number" step="0.1" name="distance_from_last_transaction" class="form-control" value="1" required></div>
-                    <div class="mb-2"><label>Purchase Price Multiplier Ratio</label><input type="number" step="0.1" name="ratio_to_median_purchase_price" class="form-control" value="1.0" required></div>
-                    <input type="hidden" name="repeat_retailer" value="1"><input type="hidden" name="used_chip" value="1"><input type="hidden" name="used_pin_number" value="1"><input type="hidden" name="online_order" value="0">
-                    <button type="submit" class="btn btn-success w-100 mt-3">Authorize Wire Transfer</button>
-                </form>
-            </div>
-            <div class="col-md-7">
-                <h4>📋 My Recent Transactions</h4><hr>
-                <table class="table table-striped table-hover">
-                    <thead><tr><th>Date</th><th>Recipient</th><th>Amount</th><th>Status</th></tr></thead>
-                    repeat_retailer: int = Form(...), used_chip: int = Form(...), used_pin_number: int = Form(...),
-online_order: int = Form(...), user: str = Depends(get_session_user)
-):
-if not user:
-raise HTTPException(status_code=401, detail="Expired session.")
-conn = get_db_connection()
-sender_profile = conn.execute("SELECT balance FROM users WHERE username = ?", (user,)).fetchone()
-if not sender_profile or sender_profile["balance"] < amount:
-conn.close()
-return HTMLResponse("alert('Failed: Insufficient Bank Account Funds.'); window.location.href='/portal';")
-class PayloadContainer:
-def model_dump(self):
-return {
-"distance_from_home": distance_from_home, "distance_from_last_transaction": distance_from_last_transaction,
-"ratio_to_median_purchase_price": ratio_to_median_purchase_price, "repeat_retailer": repeat_retailer,
-"used_chip": used_chip, "used_pin_number": used_pin_number, "online_order": online_order
-}
-results = fraud_service.predict(PayloadContainer())
-if results["fraud_prediction"] == 1:
-conn.execute("""
-INSERT INTO transactions (username, recipient, amount, distance_from_home, distance_from_last_transaction, ratio_to_median_purchase_price, repeat_retailer, used_chip, used_pin_number, online_order, fraud_prediction, fraud_probability, risk_level, decision)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-""", (user, recipient, amount, distance_from_home, distance_from_last_transaction, ratio_to_median_purchase_price, repeat_retailer, used_chip, used_pin_number, online_order, 1, results["fraud_probability"], results["risk_level"], "Blocked"))
-conn.commit()
-conn.close()
-return HTMLResponse(f"alert('🔴 SECURITY ALERT: Transaction blocked by AI Core! Risk Index Score: {results['risk_level']}. Action flagged as high-risk anomaly.'); window.location.href='/portal';")
-new_balance = sender_profile["balance"] - amount
-conn.execute("UPDATE users SET balance = ? WHERE username = ?", (new_balance, user))
-conn.execute("UPDATE users SET balance = balance + ? WHERE username = ?", (amount, recipient))
-conn.execute("""
-INSERT INTO transactions (username, recipient, amount, distance_from_home, distance_from_last_transaction, ratio_to_median_purchase_price, repeat_retailer,
-used_chip, used_pin_number, online_order, fraud_prediction, fraud_probability, risk_level, decision)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-""", (user, recipient, amount, distance_from_home, distance_from_last_transaction, ratio_to_median_purchase_price, repeat_retailer, used_chip, used_pin_number, online_order, 0, results["fraud_probability"], results["risk_level"], "Completed"))
-conn.commit()
-conn.close()
-return HTMLResponse("alert('🟢 Wire Transfer Verification Success! Funds successfully routed and settled.'); window.location.href='/portal';")
 
---- MANAGER MONITORING DASHBOARD ---
+        <div class="col-lg-7">
+          <div class="card shadow p-4">
+            <h4>Recent transactions</h4>
+            <div class="table-responsive">
+              <table class="table table-striped">
+                <thead><tr><th>Date</th><th>Recipient</th>
+                <th>Amount</th><th>Status</th></tr></thead>
+                <tbody>{transaction_rows}</tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    """, "Customer portal")
+
+
+# -------------------- FRAUD-CHECKED DEMO TRANSFER --------------------
+
+@app.post("/portal/transact")
+async def process_transaction(
+    recipient: str = Form(...),
+    amount: float = Form(...),
+    distance_from_home: float = Form(...),
+    distance_from_last_transaction: float = Form(...),
+    ratio_to_median_purchase_price: float = Form(...),
+    repeat_retailer: int = Form(...),
+    used_chip: int = Form(...),
+    used_pin_number: int = Form(...),
+    online_order: int = Form(...),
+    user: str | None = Depends(get_session_user),
+):
+    if not user:
+        raise HTTPException(status_code=401, detail="Please sign in again.")
+
+    if current_role(user) != "customer":
+        raise HTTPException(status_code=403, detail="Customer access required.")
+
+    recipient = recipient.strip()
+
+    if recipient == user:
+        return message_page("You cannot transfer money to yourself.")
+
+    if amount <= 0 or ratio_to_median_purchase_price <= 0:
+        return message_page("Amount and price ratio must be positive.")
+
+    if min(distance_from_home, distance_from_last_transaction) < 0:
+        return message_page("Distances cannot be negative.")
+
+    if any(value not in (0, 1) for value in (
+        repeat_retailer, used_chip, used_pin_number, online_order
+    )):
+        return message_page("Boolean transaction features must be 0 or 1.")
+
+    if fraud_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Fraud model unavailable. Transfer was not processed.",
+        )
+
+    # These must match the features and preprocessing used during training.
+    features = {
+        "distance_from_home": distance_from_home,
+        "distance_from_last_transaction": distance_from_last_transaction,
+        "ratio_to_median_purchase_price": ratio_to_median_purchase_price,
+        "repeat_retailer": repeat_retailer,
+        "used_chip": used_chip,
+        "used_pin_number": used_pin_number,
+        "online_order": online_order,
+    }
+
+    try:
+        # FraudDetectionService.predict must accept a dictionary.
+        result = fraud_service.predict(features)
+    except Exception as exc:
+        print(f"Prediction error: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail="Fraud prediction failed. Transfer was not processed.",
+        ) from exc
+
+    conn = get_db_connection()
+    try:
+        # Serialize balance updates to avoid concurrent overspending in SQLite.
+        conn.execute("BEGIN IMMEDIATE")
+
+        sender = conn.execute(
+            "SELECT balance FROM users WHERE username = ?", (user,)
+        ).fetchone()
+        receiver = conn.execute(
+            "SELECT username FROM users WHERE username = ?", (recipient,)
+        ).fetchone()
+
+        if not sender:
+            conn.rollback()
+            raise HTTPException(status_code=401, detail="Sender account not found.")
+
+        if not receiver:
+            conn.rollback()
+            return message_page("Recipient account not found.")
+
+        if float(sender["balance"]) < amount:
+            conn.rollback()
+            return message_page("Insufficient demo account balance.")
+
+        prediction = int(result["fraud_prediction"])
+        probability = result.get("fraud_probability")
+        risk_level = str(result.get("risk_level", "unknown"))
+        decision = "Blocked" if prediction == 1 else "Completed"
+
+        conn.execute(
+            """
+            INSERT INTO transactions (
+                username, recipient, amount,
+                distance_from_home, distance_from_last_transaction,
+                ratio_to_median_purchase_price, repeat_retailer,
+                used_chip, used_pin_number, online_order,
+                fraud_prediction, fraud_probability, risk_level, decision
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user, recipient, amount,
+                distance_from_home, distance_from_last_transaction,
+                ratio_to_median_purchase_price, repeat_retailer,
+                used_chip, used_pin_number, online_order,
+                prediction, probability, risk_level, decision,
+            ),
+        )
+
+        if prediction == 1:
+            conn.commit()
+            return message_page(
+                f"Fraud risk detected. Demo transfer blocked. Risk: {risk_level}."
+            )
+
+        conn.execute(
+            "UPDATE users SET balance = balance - ? WHERE username = ?",
+            (amount, user),
+        )
+        conn.execute(
+            "UPDATE users SET balance = balance + ? WHERE username = ?",
+            (amount, recipient),
+        )
+        conn.commit()
+
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Transfer failed. No transfer was completed.",
+        )
+    finally:
+        conn.close()
+
+    return message_page("Demo transfer completed successfully.")
+
+
+# -------------------- MANAGER DASHBOARD --------------------
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def manager_dashboard_view(user: str = Depends(get_session_user)):
-if not user:
-return RedirectResponse(url="/ui/login")
-conn = get_db_connection()
-role_check = conn.execute("SELECT role FROM users WHERE username = ?", (user,)).fetchone()
-if not role_check or role_check["role"] != "manager":
-conn.close()
-return HTMLResponse("❌ Unauthorized access. Dashboard limited to administrative manager profiles.")
-total_tx = conn.execute("SELECT COUNT() as total FROM transactions").fetchone()["total"]
-fraud_tx = conn.execute("SELECT COUNT() as fraud FROM transactions WHERE
-fraud_prediction = 1").fetchone()["fraud"]
-ledger = conn.execute("SELECT * FROM transactions ORDER BY timestamp DESC LIMIT 10").fetchall()
-conn.close()
-rows_html = "".join([f"{tx['timestamp']}{tx['username']} ➔ {tx['recipient']}${tx['amount']:.2f}{tx['distance_from_home']} km<span class='badge bg-{'danger' if tx['fraud_prediction']==1 else 'success'}'>{tx['decision']}{tx['risk_level']} ({tx['fraud_probability']:.2f})" for tx in ledger])
-return f"""
-System Administration Panel
+async def manager_dashboard(user: str | None = Depends(get_session_user)):
+    denial = require_manager(user)
+    if denial:
+        return denial
+
+    conn = get_db_connection()
+    try:
+        total = conn.execute(
+            "SELECT COUNT(*) AS total FROM transactions"
+        ).fetchone()["total"]
+
+        fraud_count = conn.execute(
+            "SELECT COUNT(*) AS total FROM transactions WHERE fraud_prediction = 1"
+        ).fetchone()["total"]
+
+        transactions = conn.execute(
+            """
+            SELECT timestamp, username, recipient, amount,
+                   distance_from_home, fraud_prediction,
+                   fraud_probability, risk_level, decision
+            FROM transactions
+            ORDER BY timestamp DESC
+            LIMIT 100
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    rows = ""
+    for tx in transactions:
+        fraud = int(tx["fraud_prediction"]) == 1
+        badge = "danger" if fraud else "success"
+        probability = tx["fraud_probability"]
+        probability_text = (
+            f"{float(probability):.3f}" if probability is not None else "N/A"
+        )
+        rows += f"""
+          <tr>
+            <td>{escape(str(tx['timestamp']))}</td>
+            <td>{escape(str(tx['username']))}</td>
+            <td>{escape(str(tx['recipient']))}</td>
+            <td>${float(tx['amount']):.2f}</td>
+            <td>{float(tx['distance_from_home']):.1f} km</td>
+            <td><span class="badge bg-{badge}">
+              {escape(str(tx['decision']))}
+            </span></td>
+            <td>{escape(str(tx['risk_level']))}</td>
+            <td>{probability_text}</td>
+          </tr>
+        """
+
+    if not rows:
+        rows = '<tr><td colspan="8">No transactions recorded.</td></tr>'
+
+    return page(f"""
+      <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2>🛡️ Manager monitoring dashboard</h2>
+        <a href="/auth/logout" class="btn btn-outline-danger">Sign out</a>
+      </div>
+
+      <div class="row g-3 mb-4">
+        <div class="col-md-6">
+          <div class="card shadow p-4">
+            <p>Total transactions inspected</p><h2>{int(total)}</h2>
+          </div>
+        </div>
+        <div class="col-md-6">
+          <div class="card shadow p-4">
+            <p>Transactions flagged as fraud</p><h2>{int(fraud_count)}</h2>
+          </div>
+        </div>
+      </div>
+
+      <div class="card shadow p-4">
+        <h4>Transaction risk ledger</h4>
+        <div class="table-responsive">
+          <table class="table table-striped">
+            <thead><tr><th>Date</th><th>Sender</th><th>Recipient</th>
+            <th>Amount</th><th>Home distance</th><th>Decision</th>
+            <th>Risk</th><th>Fraud probability</th></tr></thead>
+            <tbody>{rows}</tbody>
+          </table>
+        </div>
+      </div>
+    """, "Manager dashboard")
 
 
-🛡️ AI System Threat Control CenterDisconnect Session
-Total Inspected Network Runs{total_tx}
-Intercepted High-Risk Attacks{fraud_tx}
-
-📋 Central Processing Risk Ledger
-<thead class="table-dark"><tr><th>Timestamp
-Direction Profile Vector
-Value
-Home Offset
-Automated Decision
-Threat Probability Score
-{rows_html if rows_html else 'No transaction traffic registered. Log into a Customer Account and execute payments!
-'}
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "model_loaded": fraud_service is not None,
+    }
