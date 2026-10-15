@@ -12,7 +12,7 @@ def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 🏦 Unique Bank Users Ledger
+    # 🏦 Unique Bank Users Ledger Configuration
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -27,7 +27,7 @@ def init_db():
     )
     """)
     
-    # 📋 Unique Bank Transactions Registry
+    # 📋 Unique Bank Transactions Registry Configuration
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
