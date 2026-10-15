@@ -1,38 +1,9 @@
 
-"""
-Unique Bank Automated ML Hub
-Version: 7.0.0
-
-Features:
-- Customer registration and login
-- Kenyan county-based location selection
-- Nyeri coordinates included
-- Secure password and ATM PIN hashing
-- Customer balances and transaction history
-- Bank transfers with database transactions
-- Fraud-risk checks and optional ML integration
-- Manager dashboard
-- Session cookies and basic input validation
-
-Install:
-    pip install fastapi "uvicorn[standard]" python-multipart itsdangerous
-
-Run:
-    uvicorn main:app --reload
-
-Set these environment variables before deployment:
-    BANK_SECRET_KEY
-    ADMIN_USERNAME
-    ADMIN_PASSWORD
-    COOKIE_SECURE=true   # Set true when using HTTPS
-"""
-
 import os
 import re
 import math
 import hmac
 import html
-import json
 import sqlite3
 import hashlib
 import secrets
@@ -41,19 +12,19 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from urllib.parse import quote
 
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 
-# ---------------------------------------------------------
+# =========================================================
 # CONFIGURATION
-# ---------------------------------------------------------
+# =========================================================
 
 APP_NAME = "Unique Bank"
-APP_VERSION = "7.0.0"
+APP_VERSION = "7.1.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE_PATH = Path(
@@ -61,14 +32,10 @@ DATABASE_PATH = Path(
 )
 
 SECRET_KEY = os.getenv("BANK_SECRET_KEY")
-
 if not SECRET_KEY:
-    # Convenient for local development only. Sessions will not
-    # survive restarts. Configure BANK_SECRET_KEY in production.
     SECRET_KEY = secrets.token_urlsafe(48)
     logging.warning(
-        "BANK_SECRET_KEY is not configured. "
-        "Sessions will be invalidated when the application restarts."
+        "BANK_SECRET_KEY is unset. Sessions will not survive restarts."
     )
 
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
@@ -77,17 +44,21 @@ SESSION_MAX_AGE = 3600
 
 PASSWORD_MIN_LENGTH = 12
 STARTING_BALANCE = 10000.00
+MAX_TRANSFER = 100_000_000.00
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("unique_bank")
 
-serializer = URLSafeTimedSerializer(SECRET_KEY, salt="unique-bank-session")
+serializer = URLSafeTimedSerializer(
+    SECRET_KEY,
+    salt="unique-bank-session",
+)
 
 
-# ---------------------------------------------------------
-# KENYAN COUNTIES AND APPROXIMATE COUNTY-HEADQUARTER GPS
-# Coordinates are (latitude, longitude).
-# ---------------------------------------------------------
+# =========================================================
+# KENYAN COUNTIES
+# Approximate county-headquarters coordinates: (latitude, longitude)
+# =========================================================
 
 COUNTY_COORDINATES = {
     "Mombasa": (-4.0435, 39.6682),
@@ -139,21 +110,23 @@ COUNTY_COORDINATES = {
     "Nairobi": (-1.2921, 36.8219),
 }
 
+assert len(COUNTY_COORDINATES) == 47, "Expected all 47 Kenyan counties"
 
-# ---------------------------------------------------------
+
+# =========================================================
 # DATABASE
-# ---------------------------------------------------------
+# =========================================================
 
 def get_connection():
-    connection = sqlite3.connect(
+    conn = sqlite3.connect(
         DATABASE_PATH,
         timeout=15,
         isolation_level=None,
     )
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 15000")
-    return connection
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 15000")
+    return conn
 
 
 def init_database():
@@ -195,27 +168,26 @@ def init_database():
         """)
 
         db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_transactions_sender
+            CREATE INDEX IF NOT EXISTS idx_tx_sender
             ON transactions(sender_id, id DESC)
         """)
 
         db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_transactions_recipient
+            CREATE INDEX IF NOT EXISTS idx_tx_recipient
             ON transactions(recipient_id, id DESC)
         """)
 
         db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_transactions_status
+            CREATE INDEX IF NOT EXISTS idx_tx_status
             ON transactions(status)
         """)
 
 
-# ---------------------------------------------------------
-# PASSWORD AND PIN SECURITY
-# ---------------------------------------------------------
+# =========================================================
+# PASSWORD AND PIN HASHING
+# =========================================================
 
 def hash_secret(value: str) -> str:
-    """Hash a password or PIN using a salted PBKDF2 digest."""
     salt = secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac(
         "sha256",
@@ -233,58 +205,157 @@ def verify_secret(value: str, stored_hash: str) -> bool:
         if algorithm != "pbkdf2_sha256":
             return False
 
-        expected = bytes.fromhex(digest_hex)
         actual = hashlib.pbkdf2_hmac(
             "sha256",
             value.encode("utf-8"),
             bytes.fromhex(salt_hex),
             310_000,
         )
-        return hmac.compare_digest(actual, expected)
-    except (ValueError, TypeError):
+
+        return hmac.compare_digest(actual, bytes.fromhex(digest_hex))
+
+    except (ValueError, TypeError, AttributeError):
         return False
 
 
-# ---------------------------------------------------------
-# SESSION MANAGEMENT
-# ---------------------------------------------------------
+# =========================================================
+# LOCATION AND FRAUD HELPERS
+# =========================================================
+
+def calculate_gps_distance(lat1, lon1, lat2, lon2) -> float:
+    """Calculate the approximate distance between GPS coordinates in km."""
+    try:
+        values = [float(lat1), float(lon1), float(lat2), float(lon2)]
+        if not all(math.isfinite(v) for v in values):
+            return 0.0
+
+        lat1, lon1, lat2, lon2 = values
+        if not (
+            -90 <= lat1 <= 90
+            and -90 <= lat2 <= 90
+            and -180 <= lon1 <= 180
+            and -180 <= lon2 <= 180
+        ):
+            return 0.0
+
+        radius = 6371.0
+
+        p1 = math.radians(lat1)
+        p2 = math.radians(lat2)
+        dp = math.radians(lat2 - lat1)
+        dl = math.radians(lon2 - lon1)
+
+        a = (
+            math.sin(dp / 2) ** 2
+            + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+        )
+        a = max(0.0, min(1.0, a))
+
+        return round(radius * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)), 2)
+
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def valid_coordinates(lat, lon) -> bool:
+    try:
+        lat = float(lat)
+        lon = float(lon)
+        return (
+            math.isfinite(lat)
+            and math.isfinite(lon)
+            and -90 <= lat <= 90
+            and -180 <= lon <= 180
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def assess_risk(amount, home_distance, last_distance, balance):
+    """
+    Demonstration risk rules. Replace or augment these with a properly
+    trained and validated fraud-detection model before production use.
+    """
+    score = 0.0
+    reasons = []
+
+    if amount >= 100_000:
+        score += 0.35
+        reasons.append("large transfer amount")
+
+    if balance > 0 and amount / balance >= 0.8:
+        score += 0.20
+        reasons.append("large proportion of available balance")
+
+    if home_distance > 1500:
+        score += 0.50
+        reasons.append("unusual distance from registered county")
+
+    if last_distance > 800:
+        score += 0.40
+        reasons.append("unusual distance from previous transaction")
+
+    return min(score, 1.0), (
+        ", ".join(reasons) if reasons else "Rule checks passed"
+    )
+
+
+# =========================================================
+# SESSIONS AND HTML HELPERS
+# =========================================================
 
 def get_session_user(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
-
     if not token:
         return None
 
     try:
-        session_data = serializer.loads(
-            token,
-            max_age=SESSION_MAX_AGE,
-        )
-    except (BadSignature, SignatureExpired):
-        return None
-
-    user_id = session_data.get("user_id")
-
-    if not isinstance(user_id, int):
+        data = serializer.loads(token, max_age=SESSION_MAX_AGE)
+        user_id = data.get("user_id")
+        if not isinstance(user_id, int):
+            return None
+    except (BadSignature, SignatureExpired, TypeError):
         return None
 
     with get_connection() as db:
         return db.execute(
             """
             SELECT id, username, role, balance, county, home_lat, home_lon
-            FROM users
-            WHERE id = ?
+            FROM users WHERE id = ?
             """,
             (user_id,),
         ).fetchone()
 
 
-def set_session_cookie(response: RedirectResponse, user_id: int):
-    token = serializer.dumps({"user_id": user_id})
+def esc(value):
+    return html.escape(str(value if value is not None else ""), quote=True)
 
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def money(value):
+    return f"KSh {float(value):,.2f}"
+
+
+def message_from_request(request):
+    return request.query_params.get("message", "")
+
+
+def redirect_message(path, message):
+    separator = "&" if "?" in path else "?"
+    return RedirectResponse(
+        f"{path}{separator}message={quote(message)}",
+        status_code=303,
+    )
+
+
+def set_session_cookie(response, user_id):
+    token = serializer.dumps({"user_id": user_id})
     response.set_cookie(
-        key=SESSION_COOKIE,
-        value=token,
+        SESSION_COOKIE,
+        token,
         max_age=SESSION_MAX_AGE,
         httponly=True,
         secure=COOKIE_SECURE,
@@ -293,338 +364,153 @@ def set_session_cookie(response: RedirectResponse, user_id: int):
     )
 
 
-def clear_session_cookie(response: RedirectResponse):
+def clear_session_cookie(response):
     response.delete_cookie(
         SESSION_COOKIE,
         path="/",
-        secure=COOKIE_SECURE,
         httponly=True,
+        secure=COOKIE_SECURE,
         samesite="lax",
     )
 
 
-# ---------------------------------------------------------
-# GENERAL HELPERS
-# ---------------------------------------------------------
-
-def esc(value) -> str:
-    return html.escape(str(value if value is not None else ""), quote=True)
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def money(value) -> str:
-    return f"KSh {float(value):,.2f}"
-
-
-def valid_username(username: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z0-9_]{3,30}", username))
-
-
-def valid_coordinates(lat, lon) -> bool:
-    try:
-        lat = float(lat)
-        lon = float(lon)
-        return -90 <= lat <= 90 and -180 <= lon <= 180
-    except (TypeError, ValueError):
-        return False
-
-
-def calculate_gps_distance(lat1, lon1, lat2, lon2) -> float:
-    """Return approximate distance in kilometres using Haversine."""
-    earth_radius_km = 6371.0
-
-    lat1, lon1, lat2, lon2 = map(
-        math.radians,
-        [float(lat1), float(lon1), float(lat2), float(lon2)],
-    )
-
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-
-    a = (
-        math.sin(dlat / 2) ** 2
-        + math.cos(lat1)
-        * math.cos(lat2)
-        * math.sin(dlon / 2) ** 2
-    )
-
-    return earth_radius_km * 2 * math.asin(math.sqrt(min(1.0, a)))
-
-
-def page(title: str, body: str, user=None) -> HTMLResponse:
-    nav = """
-        <a href="/">Home</a>
-        <a href="/ui/register">Register</a>
-        <a href="/ui/login">Login</a>
-    """
-
+def render_page(title, body, user=None):
     if user:
+        dashboard_link = (
+            '<a href="/dashboard">Manager dashboard</a>'
+            if user["role"] == "manager" else ""
+        )
         nav = f"""
             <a href="/">Home</a>
-            <a href="/portal">My account</a>
-            {"<a href='/dashboard'>Manager dashboard</a>" if user["role"] == "manager" else ""}
+            <a href="/portal">Account</a>
+            {dashboard_link}
             <form class="inline" method="post" action="/auth/logout">
-                <button class="link-button" type="submit">Log out</button>
+                <button class="nav-button" type="submit">Log out</button>
             </form>
         """
+    else:
+        nav = """
+            <a href="/">Home</a>
+            <a href="/ui/register">Register</a>
+            <a href="/ui/login">Log in</a>
+        """
 
-    document = f"""<!DOCTYPE html>
+    return HTMLResponse(f"""<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{esc(title)} | {APP_NAME}</title>
 <style>
-    :root {{
-        color-scheme: light;
-        --navy: #10243a;
-        --blue: #185adb;
-        --bg: #f2f5fa;
-        --text: #202a36;
-        --border: #dce3ed;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-        margin: 0; background: var(--bg); color: var(--text);
-        font: 16px/1.5 system-ui, -apple-system, sans-serif;
-    }}
-    header {{
-        background: var(--navy); color: white; padding: 16px 22px;
-        display: flex; align-items: center; justify-content: space-between;
-        gap: 16px; flex-wrap: wrap;
-    }}
-    header strong {{ font-size: 1.15rem; }}
-    nav {{ display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }}
-    nav a, .link-button {{ color: white; text-decoration: none; }}
-    main {{ max-width: 1100px; margin: 28px auto; padding: 0 16px; }}
-    .card {{
-        background: white; border: 1px solid var(--border);
-        border-radius: 14px; padding: 22px; margin-bottom: 18px;
-        box-shadow: 0 4px 18px rgba(16,36,58,.04);
-    }}
-    .grid {{
-        display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr));
-        gap: 16px;
-    }}
-    h1, h2, h3 {{ line-height: 1.2; }}
-    label {{ display: block; margin-top: 14px; font-weight: 600; }}
-    input, select {{
-        display: block; width: 100%; margin-top: 6px; padding: 11px;
-        border: 1px solid #bdc8d7; border-radius: 8px; font: inherit;
-        background: white;
-    }}
-    button, .button {{
-        display: inline-block; background: var(--blue); color: white;
-        border: 0; border-radius: 8px; padding: 11px 16px;
-        font: inherit; font-weight: 650; cursor: pointer;
-        text-decoration: none; margin-top: 14px;
-    }}
-    .secondary {{ background: #526477; }}
-    .danger {{ color: #9c2424; }}
-    .notice {{
-        padding: 12px 14px; border-radius: 8px;
-        background: #edf4ff; margin-bottom: 16px;
-    }}
-    .muted {{ color: #657487; }}
-    .balance {{ font-size: 1.7rem; font-weight: 750; }}
-    .table-wrap {{ overflow-x: auto; }}
-    table {{ width: 100%; border-collapse: collapse; background: white; }}
-    th, td {{
-        text-align: left; padding: 11px; border-bottom: 1px solid var(--border);
-        white-space: nowrap;
-    }}
-    th {{ background: #f7f9fc; }}
-    .inline {{ display: inline; margin: 0; }}
-    .link-button {{
-        background: none; border: none; padding: 0; margin: 0;
-        font: inherit; cursor: pointer;
-    }}
-    footer {{ text-align: center; padding: 24px; color: #657487; }}
+:root {{
+  --navy:#10243a; --blue:#185adb; --background:#f2f5fa;
+  --border:#dce3ed; --text:#202a36;
+}}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; background:var(--background); color:var(--text);
+  font:16px/1.5 system-ui, sans-serif; }}
+header {{ background:var(--navy); color:white; padding:16px 22px;
+  display:flex; justify-content:space-between; align-items:center; gap:16px;
+  flex-wrap:wrap; }}
+header strong {{ font-size:1.2rem; }}
+nav {{ display:flex; align-items:center; flex-wrap:wrap; gap:16px; }}
+nav a,.nav-button {{ color:white; text-decoration:none; }}
+.nav-button {{ background:transparent; padding:0; margin:0; }}
+main {{ max-width:1150px; margin:28px auto; padding:0 16px; }}
+.card {{ background:white; border:1px solid var(--border); border-radius:14px;
+  padding:22px; margin-bottom:18px; box-shadow:0 4px 18px #10243a08; }}
+.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+  gap:16px; }}
+label {{ display:block; margin-top:14px; font-weight:600; }}
+input,select {{ display:block; width:100%; padding:11px; margin-top:6px;
+  border:1px solid #bdc8d7; border-radius:8px; font:inherit; background:white; }}
+button,.button {{ display:inline-block; background:var(--blue); color:white;
+  border:0; border-radius:8px; padding:11px 16px; margin-top:14px;
+  font:inherit; font-weight:650; cursor:pointer; text-decoration:none; }}
+.secondary {{ background:#526477; }}
+.inline {{ display:inline; margin:0; }}
+.notice {{ padding:12px 14px; border-radius:8px; background:#edf4ff;
+  margin-bottom:16px; }}
+.muted {{ color:#657487; }}
+.balance {{ font-size:1.7rem; font-weight:750; }}
+.table-wrap {{ overflow-x:auto; }}
+table {{ width:100%; border-collapse:collapse; background:white; }}
+th,td {{ text-align:left; padding:11px; border-bottom:1px solid var(--border); }}
+th {{ background:#f7f9fc; }}
+footer {{ text-align:center; color:#657487; padding:24px; }}
 </style>
 </head>
 <body>
 <header>
-    <strong>{APP_NAME}</strong>
-    <nav>{nav}</nav>
+  <strong>🛡️ {APP_NAME}</strong>
+  <nav>{nav}</nav>
 </header>
 <main>{body}</main>
 <footer>{APP_NAME} · Version {APP_VERSION} · Demonstration application</footer>
 </body>
-</html>"""
+</html>""")
 
-    return HTMLResponse(document)
-
-
-def notice(message: str) -> str:
-    return f'<div class="notice">{esc(message)}</div>'
-
-
-def redirect_with_message(path: str, message: str):
-    separator = "&" if "?" in path else "?"
-    from urllib.parse import quote
-    return RedirectResponse(
-        f"{path}{separator}message={quote(message)}",
-        status_code=303,
-    )
-
-
-def message_from_request(request: Request) -> str:
-    return request.query_params.get("message", "")
-
-
-# ---------------------------------------------------------
-# FRAUD DETECTION
-# ---------------------------------------------------------
-
-def assess_transaction_risk(
-    amount: float,
-    distance_km: float,
-    sender_balance: float,
-) -> tuple[float, str]:
-    """
-    Basic fallback risk rules.
-
-    This is NOT a trained ML model. Connect your trained model
-    before using the service for real banking decisions.
-    """
-    score = 0.0
-    reasons = []
-
-    if amount >= 100_000:
-        score += 0.45
-        reasons.append("large transfer")
-
-    if distance_km >= 200:
-        score += 0.30
-        reasons.append("large location difference")
-
-    if sender_balance > 0 and amount / sender_balance >= 0.8:
-        score += 0.20
-        reasons.append("transfer uses most of available balance")
-
-    return min(score, 1.0), ", ".join(reasons) or "low rule-based risk"
-
-
-def ml_risk_score(
-    amount: float,
-    distance_km: float,
-    sender_balance: float,
-) -> Optional[float]:
-    """
-    Optional integration point for an existing trained model.
-
-    The function expects app.model_service to expose a
-    FraudDetectionService class and a PayloadContainer class.
-    Adapt the payload fields below to match your trained model's
-    exact input schema.
-
-    Returns None if the service cannot be used; the rule-based
-    fallback will then be used.
-    """
-    try:
-        from app.model_service import FraudDetectionService, PayloadContainer
-
-        service = FraudDetectionService()
-
-        # Update these field names to match your model's schema.
-        payload = PayloadContainer()
-
-        if hasattr(payload, "amount"):
-            payload.amount = amount
-        if hasattr(payload, "distance_km"):
-            payload.distance_km = distance_km
-        if hasattr(payload, "sender_balance"):
-            payload.sender_balance = sender_balance
-
-        prediction = service.predict(payload)
-
-        if isinstance(prediction, dict):
-            raw_score = prediction.get(
-                "risk_score",
-                prediction.get("probability"),
-            )
-            if raw_score is not None:
-                return max(0.0, min(float(raw_score), 1.0))
-
-            fraud_flag = prediction.get(
-                "fraud_prediction",
-                prediction.get("prediction"),
-            )
-            if fraud_flag is not None:
-                return 1.0 if int(fraud_flag) == 1 else 0.0
-
-        if isinstance(prediction, (int, float)):
-            return max(0.0, min(float(prediction), 1.0))
-
-        if isinstance(prediction, (list, tuple)) and prediction:
-            return max(0.0, min(float(prediction[0]), 1.0))
-
-    except Exception:
-        logger.exception("ML model unavailable; using fallback risk rules")
-
-    return None
-
-
-# ---------------------------------------------------------
-# MANAGER ACCOUNT PROVISIONING
-# ---------------------------------------------------------
 
 def provision_manager():
-    username = os.getenv("ADMIN_USERNAME")
-    password = os.getenv("ADMIN_PASSWORD")
+    """
+    Creates the first manager only when credentials are supplied through
+    environment variables. Public registration cannot assign manager roles.
+    """
+    username = os.getenv("ADMIN_USERNAME", "").strip()
+    password = os.getenv("ADMIN_PASSWORD", "")
 
-    # Never create a public, hardcoded default manager account.
     if not username or not password:
         logger.info(
-            "Manager provisioning skipped. Set ADMIN_USERNAME and "
-            "ADMIN_PASSWORD to create the initial manager account."
+            "No initial manager provisioned. Set ADMIN_USERNAME and "
+            "ADMIN_PASSWORD before startup if a manager account is needed."
         )
         return
 
-    if not valid_username(username):
-        logger.error("ADMIN_USERNAME does not meet username requirements.")
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", username):
+        logger.error("ADMIN_USERNAME must be 3-30 letters, numbers or underscores.")
         return
 
     if len(password) < PASSWORD_MIN_LENGTH:
         logger.error("ADMIN_PASSWORD must be at least 12 characters.")
         return
 
-    lat, lon = COUNTY_COORDINATES["Nairobi"]
+    coords = COUNTY_COORDINATES["Nairobi"]
 
     with get_connection() as db:
-        existing = db.execute(
+        exists = db.execute(
             "SELECT id FROM users WHERE username = ?",
             (username,),
         ).fetchone()
 
-        if existing:
-            # Do not silently change an existing account's role.
+        if exists:
             return
 
         db.execute(
             """
             INSERT INTO users (
-                username, password_hash, pin_hash, role, balance,
-                county, home_lat, home_lon, created_at
-            )
-            VALUES (?, ?, ?, 'manager', 0, ?, ?, ?, ?)
-            """,
+                username,password_hash,pin_hash,role,balance,county,
+                home_lat,home_lon,created_at
+            ) VALUES (?,?,?,'manager',0,?,?,?,?,?)
+            """.replace(
+                "VALUES (?,?,?,'manager',0,?,?,?,?,?)",
+                "VALUES (?,?,?,'manager',0,?,?,?,?)",
+            ),
             (
                 username,
                 hash_secret(password),
                 hash_secret(secrets.token_urlsafe(24)),
                 "Nairobi",
-                lat,
-                lon,
+                coords[0],
+                coords[1],
                 now_iso(),
             ),
         )
-
         logger.info("Initial manager account created.")
 
+
+# =========================================================
+# APPLICATION LIFECYCLE
+# =========================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -634,57 +520,52 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Unique Bank Automated ML Hub",
+    title="Unique Bank Automated Hub",
     version=APP_VERSION,
     lifespan=lifespan,
 )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # HOME
-# ---------------------------------------------------------
+# =========================================================
 
 @app.get("/", response_class=HTMLResponse)
-def home(request: Request):
-    user = get_session_user(request)
-
-    body = f"""
-    <section class="card">
-        <h1>Welcome to Unique Bank</h1>
-        <p>Manage your account, transfer funds, and review your
-        transaction history in one place.</p>
-        <p class="muted">County selection covers all 47 counties of Kenya.</p>
-        <a class="button" href="/ui/register">Open an account</a>
-        <a class="button secondary" href="/ui/login">Log in</a>
-    </section>
-    <section class="grid">
-        <div class="card">
-            <h3>Customer accounts</h3>
-            <p>Register with a Kenyan county and manage your account.</p>
-        </div>
-        <div class="card">
-            <h3>Transaction monitoring</h3>
-            <p>Transfers are checked for risk before balances are updated.</p>
-        </div>
-        <div class="card">
-            <h3>Account oversight</h3>
-            <p>Authorized managers can review account and transaction activity.</p>
-        </div>
-    </section>
-    """
-
-    return page("Home", body, user)
-
-
-# ---------------------------------------------------------
-# REGISTRATION FORM
-# ---------------------------------------------------------
-
-@app.get("/ui/register", response_class=HTMLResponse)
-def register_page(request: Request):
+def home_portal(request: Request):
     user = get_session_user(request)
 
     if user:
+        target = "/dashboard" if user["role"] == "manager" else "/portal"
+        return RedirectResponse(target, status_code=303)
+
+    body = """
+    <section class="card">
+      <h1>Welcome to Unique Bank</h1>
+      <p>Manage your account, transfer funds and review your transaction
+      history in one place.</p>
+      <p class="muted">Location selection includes all 47 counties of Kenya.</p>
+      <a class="button" href="/ui/register">Open an account</a>
+      <a class="button secondary" href="/ui/login">Log in</a>
+    </section>
+    <section class="grid">
+      <div class="card"><h3>Customer accounts</h3>
+        <p>Register using your Kenyan county.</p></div>
+      <div class="card"><h3>Transaction monitoring</h3>
+        <p>Transfers undergo risk checks before settlement.</p></div>
+      <div class="card"><h3>Manager oversight</h3>
+        <p>Authorized managers can review account and transaction activity.</p></div>
+    </section>
+    """
+    return render_page("Home", body)
+
+
+# =========================================================
+# REGISTRATION
+# =========================================================
+
+@app.get("/ui/register", response_class=HTMLResponse)
+def view_register_form(request: Request):
+    if get_session_user(request):
         return RedirectResponse("/portal", status_code=303)
 
     options = "".join(
@@ -692,73 +573,70 @@ def register_page(request: Request):
         for county in sorted(COUNTY_COORDINATES)
     )
 
+    msg = message_from_request(request)
+
     body = f"""
     <section class="card">
-        <h1>Create your account</h1>
-        {notice(message_from_request(request)) if message_from_request(request) else ""}
-        <form method="post" action="/auth/register">
-            <label for="username">Username</label>
-            <input id="username" name="username" minlength="3" maxlength="30"
-                pattern="[A-Za-z0-9_]+" required autocomplete="username">
+      <h1>Create a Unique Bank account</h1>
+      {f'<div class="notice">{esc(msg)}</div>' if msg else ''}
+      <form method="post" action="/auth/register">
+        <label for="username">Username</label>
+        <input id="username" name="username" minlength="3" maxlength="30"
+          pattern="[A-Za-z0-9_]+" required autocomplete="username">
 
-            <label for="password">Password</label>
-            <input id="password" name="password" type="password"
-                minlength="{PASSWORD_MIN_LENGTH}" required
-                autocomplete="new-password">
+        <label for="password">Password (minimum {PASSWORD_MIN_LENGTH} characters)</label>
+        <input id="password" name="password" type="password"
+          minlength="{PASSWORD_MIN_LENGTH}" required autocomplete="new-password">
 
-            <label for="pin">ATM PIN (4 digits)</label>
-            <input id="pin" name="pin" type="password" inputmode="numeric"
-                pattern="[0-9]{{4}}" minlength="4" maxlength="4" required
-                autocomplete="off">
+        <label for="atm_pin">Transaction ATM PIN (4 digits)</label>
+        <input id="atm_pin" name="atm_pin" type="password" inputmode="numeric"
+          pattern="[0-9]{{4}}" minlength="4" maxlength="4" required
+          autocomplete="off">
 
-            <label for="county">County of residence</label>
-            <select id="county" name="county" required>
-                <option value="">Choose your county</option>
-                {options}
-            </select>
+        <label for="county">Home county</label>
+        <select id="county" name="county" required>
+          <option value="">Select your county</option>
+          {options}
+        </select>
 
-            <button type="submit">Register</button>
-        </form>
-        <p class="muted">Passwords must be at least {PASSWORD_MIN_LENGTH}
-        characters. Do not reuse a password from another service.</p>
+        <button type="submit">Create account</button>
+      </form>
+      <p class="muted">New registrations are customer accounts.
+      Manager privileges cannot be selected here.</p>
     </section>
     """
-
-    return page("Register", body)
+    return render_page("Register", body)
 
 
 @app.post("/auth/register")
-def register(
+def process_register(
     username: str = Form(...),
     password: str = Form(...),
-    pin: str = Form(...),
+    atm_pin: str = Form(...),
     county: str = Form(...),
 ):
     username = username.strip()
 
-    if not valid_username(username):
-        return redirect_with_message(
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", username):
+        return redirect_message(
             "/ui/register",
-            "Use 3–30 letters, numbers, or underscores for the username.",
+            "Username must be 3-30 letters, numbers or underscores.",
         )
 
     if len(password) < PASSWORD_MIN_LENGTH:
-        return redirect_with_message(
+        return redirect_message(
             "/ui/register",
             f"Password must be at least {PASSWORD_MIN_LENGTH} characters.",
         )
 
-    if not re.fullmatch(r"\d{4}", pin):
-        return redirect_with_message(
+    if not re.fullmatch(r"\d{4}", atm_pin):
+        return redirect_message(
             "/ui/register",
-            "ATM PIN must contain exactly four digits.",
+            "The transaction PIN must contain exactly four digits.",
         )
 
     if county not in COUNTY_COORDINATES:
-        return redirect_with_message(
-            "/ui/register",
-            "Choose a valid Kenyan county.",
-        )
+        return redirect_message("/ui/register", "Select a valid Kenyan county.")
 
     lat, lon = COUNTY_COORDINATES[county]
 
@@ -767,15 +645,14 @@ def register(
             db.execute(
                 """
                 INSERT INTO users (
-                    username, password_hash, pin_hash, role, balance,
-                    county, home_lat, home_lon, created_at
-                )
-                VALUES (?, ?, ?, 'customer', ?, ?, ?, ?, ?)
+                    username,password_hash,pin_hash,role,balance,
+                    county,home_lat,home_lon,created_at
+                ) VALUES (?,?,?,'customer',?,?,?,?,?)
                 """,
                 (
                     username,
                     hash_secret(password),
-                    hash_secret(pin),
+                    hash_secret(atm_pin),
                     STARTING_BALANCE,
                     county,
                     lat,
@@ -784,83 +661,67 @@ def register(
                 ),
             )
     except sqlite3.IntegrityError:
-        return redirect_with_message(
-            "/ui/register",
-            "That username is already taken.",
-        )
+        return redirect_message("/ui/register", "That username already exists.")
     except sqlite3.Error:
         logger.exception("Registration failed")
-        return redirect_with_message(
+        return redirect_message(
             "/ui/register",
-            "Registration could not be completed. Please try again.",
+            "Registration failed due to a database error.",
         )
 
-    return redirect_with_message(
+    return redirect_message(
         "/ui/login",
-        "Registration successful. You can now log in.",
+        "Account created successfully. You can now log in.",
     )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # LOGIN AND LOGOUT
-# ---------------------------------------------------------
+# =========================================================
 
 @app.get("/ui/login", response_class=HTMLResponse)
-def login_page(request: Request):
-    user = get_session_user(request)
-
-    if user:
+def view_login_form(request: Request):
+    if get_session_user(request):
         return RedirectResponse("/portal", status_code=303)
 
     msg = message_from_request(request)
 
     body = f"""
     <section class="card">
-        <h1>Log in</h1>
-        {notice(msg) if msg else ""}
-        <form method="post" action="/auth/login">
-            <label for="username">Username</label>
-            <input id="username" name="username" required
-                autocomplete="username">
+      <h1>Secure login</h1>
+      {f'<div class="notice">{esc(msg)}</div>' if msg else ''}
+      <form method="post" action="/auth/login">
+        <label for="username">Username</label>
+        <input id="username" name="username" required autocomplete="username">
 
-            <label for="password">Password</label>
-            <input id="password" name="password" type="password" required
-                autocomplete="current-password">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" required
+          autocomplete="current-password">
 
-            <button type="submit">Log in</button>
-        </form>
+        <button type="submit">Log in</button>
+      </form>
     </section>
     """
-
-    return page("Login", body)
+    return render_page("Login", body)
 
 
 @app.post("/auth/login")
-def login(
+def process_login(
     username: str = Form(...),
     password: str = Form(...),
 ):
-    username = username.strip()
-
     with get_connection() as db:
-        user = db.execute(
+        row = db.execute(
             "SELECT id, password_hash, role FROM users WHERE username = ?",
-            (username,),
+            (username.strip(),),
         ).fetchone()
 
-    if not user or not verify_secret(password, user["password_hash"]):
-        # Keep the error generic so the account's existence is not disclosed.
-        return redirect_with_message(
-            "/ui/login",
-            "Invalid username or password.",
-        )
+    if not row or not verify_secret(password, row["password_hash"]):
+        return redirect_message("/ui/login", "Invalid username or password.")
 
-    destination = (
-        "/dashboard" if user["role"] == "manager" else "/portal"
-    )
-
+    destination = "/dashboard" if row["role"] == "manager" else "/portal"
     response = RedirectResponse(destination, status_code=303)
-    set_session_cookie(response, user["id"])
+    set_session_cookie(response, row["id"])
     return response
 
 
@@ -871,12 +732,12 @@ def logout():
     return response
 
 
-# ---------------------------------------------------------
-# CUSTOMER PORTAL
-# ---------------------------------------------------------
+# =========================================================
+# CUSTOMER PORTAL AND TRANSACTION LEDGER
+# =========================================================
 
 @app.get("/portal", response_class=HTMLResponse)
-def portal(request: Request):
+def customer_banking_portal(request: Request):
     user = get_session_user(request)
 
     if not user:
@@ -886,150 +747,148 @@ def portal(request: Request):
         return RedirectResponse("/dashboard", status_code=303)
 
     with get_connection() as db:
-        transactions = db.execute(
+        ledger = db.execute(
             """
-            SELECT t.id, t.sender_id, t.recipient_id, t.amount,
-                   t.status, t.reason, t.created_at,
+            SELECT t.id,t.sender_id,t.recipient_id,t.amount,t.status,
+                   t.reason,t.created_at,
                    s.username AS sender_name,
                    r.username AS recipient_name
             FROM transactions t
             JOIN users s ON s.id = t.sender_id
             JOIN users r ON r.id = t.recipient_id
             WHERE t.sender_id = ? OR t.recipient_id = ?
-            ORDER BY t.id DESC
-            LIMIT 30
+            ORDER BY t.id DESC LIMIT 20
             """,
             (user["id"], user["id"]),
         ).fetchall()
 
     rows = ""
 
-    for tx in transactions:
+    for tx in ledger:
         if tx["sender_id"] == user["id"]:
-            direction = f"Sent to {esc(tx['recipient_name'])}"
-            amount_text = f"- {money(tx['amount'])}"
+            details = f"Sent to {esc(tx['recipient_name'])}"
+            value = f"- {money(tx['amount'])}"
         else:
-            direction = f"Received from {esc(tx['sender_name'])}"
-            amount_text = f"+ {money(tx['amount'])}"
+            details = f"Received from {esc(tx['sender_name'])}"
+            value = f"+ {money(tx['amount'])}"
 
         rows += f"""
         <tr>
-            <td>{tx['id']}</td>
-            <td>{direction}</td>
-            <td>{amount_text}</td>
-            <td>{esc(tx['status'])}</td>
-            <td>{esc(tx['created_at'])}</td>
+          <td>{esc(tx['created_at'])}</td>
+          <td>{details}</td>
+          <td>{value}</td>
+          <td>{esc(tx['status'])}</td>
+          <td>{esc(tx['reason'])}</td>
         </tr>
         """
 
     if not rows:
-        rows = '<tr><td colspan="5">No transactions yet.</td></tr>'
+        rows = '<tr><td colspan="5">No transactions recorded yet.</td></tr>'
 
+    msg = message_from_request(request)
     body = f"""
-    {notice(message_from_request(request)) if message_from_request(request) else ""}
+    {f'<div class="notice">{esc(msg)}</div>' if msg else ''}
+
     <section class="grid">
-        <div class="card">
-            <h2>Welcome, {esc(user['username'])}</h2>
-            <p class="muted">County: {esc(user['county'])}</p>
-            <p class="muted">Home coordinates:
-                {float(user['home_lat']):.5f},
-                {float(user['home_lon']):.5f}</p>
-        </div>
-        <div class="card">
-            <h3>Available balance</h3>
-            <div class="balance">{money(user['balance'])}</div>
-        </div>
+      <div class="card">
+        <h2>Welcome, {esc(user['username'])}</h2>
+        <p>Registered home county: <strong>{esc(user['county'])}</strong></p>
+        <p class="muted">Home coordinates:
+          {float(user['home_lat']):.5f}, {float(user['home_lon']):.5f}</p>
+      </div>
+      <div class="card">
+        <h3>Available balance</h3>
+        <div class="balance">{money(user['balance'])}</div>
+      </div>
     </section>
 
     <section class="card">
-        <h2>Transfer funds</h2>
-        <form method="post" action="/portal/transact" id="transfer-form">
-            <label for="recipient">Recipient username</label>
-            <input id="recipient" name="recipient" required maxlength="30">
+      <h2>Transfer funds</h2>
+      <form id="payment_form" method="post" action="/portal/transact">
+        <label for="recipient">Recipient username</label>
+        <input id="recipient" name="recipient" required maxlength="30">
 
-            <label for="amount">Amount (KSh)</label>
-            <input id="amount" name="amount" type="number" min="1"
-                step="0.01" max="100000000" required>
+        <label for="amount">Amount (KSh)</label>
+        <input id="amount" name="amount" type="number" min="1"
+          max="{MAX_TRANSFER:.2f}" step="0.01" required>
 
-            <label for="pin">ATM PIN</label>
-            <input id="pin" name="pin" type="password" inputmode="numeric"
-                pattern="[0-9]{{4}}" minlength="4" maxlength="4" required
-                autocomplete="off">
+        <label for="input_pin">Transaction ATM PIN</label>
+        <input id="input_pin" name="input_pin" type="password"
+          inputmode="numeric" pattern="[0-9]{{4}}" minlength="4"
+          maxlength="4" required autocomplete="off">
 
-            <input type="hidden" name="sender_lat" id="sender_lat">
-            <input type="hidden" name="sender_lon" id="sender_lon">
+        <input type="hidden" name="live_lat" id="live_lat">
+        <input type="hidden" name="live_lon" id="live_lon">
 
-            <button type="submit">Submit transfer</button>
-            <button type="button" class="secondary" id="location-button">
-                Use current location
-            </button>
-            <p class="muted" id="location-status">
-                By default, your registered county coordinates are used.
-                You may choose to share browser location.
-            </p>
-        </form>
+        <button type="submit">Transfer using registered county</button>
+        <button type="button" id="location_button" class="secondary">
+          Use current browser location
+        </button>
+        <p class="muted" id="location_status">
+          Registered county coordinates are used unless you choose to share
+          browser location. Location is a risk signal, not proof of identity.
+        </p>
+      </form>
     </section>
 
     <section class="card">
-        <h2>Recent transactions</h2>
-        <div class="table-wrap">
-            <table>
-                <thead>
-                    <tr><th>ID</th><th>Details</th><th>Amount</th>
-                    <th>Status</th><th>Date</th></tr>
-                </thead>
-                <tbody>{rows}</tbody>
-            </table>
-        </div>
+      <h2>Recent activity ledger</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Timestamp</th><th>Details</th><th>Amount</th>
+            <th>Status</th><th>Note</th>
+          </tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
     </section>
 
     <script>
-    const locationButton = document.getElementById("location-button");
-    const statusText = document.getElementById("location-status");
+    document.getElementById("location_button").addEventListener("click", () => {{
+      const status = document.getElementById("location_status");
 
-    locationButton.addEventListener("click", function () {{
-        if (!navigator.geolocation) {{
-            statusText.textContent =
-                "Geolocation is unavailable. Registered county coordinates will be used.";
-            return;
-        }}
+      if (!navigator.geolocation) {{
+        status.textContent =
+          "Geolocation is unavailable. Registered county coordinates will be used.";
+        return;
+      }}
 
-        statusText.textContent = "Requesting location permission...";
+      status.textContent = "Requesting browser location permission...";
 
-        navigator.geolocation.getCurrentPosition(
-            function (position) {{
-                document.getElementById("sender_lat").value =
-                    position.coords.latitude;
-                document.getElementById("sender_lon").value =
-                    position.coords.longitude;
-                statusText.textContent =
-                    "Location captured for this transfer.";
-            }},
-            function () {{
-                statusText.textContent =
-                    "Location permission was unavailable. Registered county coordinates will be used.";
-            }},
-            {{ enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 }}
-        );
+      navigator.geolocation.getCurrentPosition(
+        position => {{
+          document.getElementById("live_lat").value =
+            position.coords.latitude;
+          document.getElementById("live_lon").value =
+            position.coords.longitude;
+          status.textContent = "Location captured for the next transfer.";
+        }},
+        () => {{
+          status.textContent =
+            "Location unavailable. Registered county coordinates will be used.";
+        }},
+        {{ enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 }}
+      );
     }});
     </script>
     """
 
-    return page("Customer portal", body, user)
+    return render_page("Customer portal", body, user)
 
 
-# ---------------------------------------------------------
+# =========================================================
 # TRANSFER PROCESSING
-# ---------------------------------------------------------
+# =========================================================
 
 @app.post("/portal/transact")
-def transact(
+def process_transaction(
     request: Request,
     recipient: str = Form(...),
     amount: float = Form(...),
-    pin: str = Form(...),
-    sender_lat: str = Form(""),
-    sender_lon: str = Form(""),
+    input_pin: str = Form(...),
+    live_lat: str = Form(""),
+    live_lon: str = Form(""),
 ):
     user = get_session_user(request)
 
@@ -1041,320 +900,301 @@ def transact(
 
     recipient = recipient.strip()
 
-    if not valid_username(recipient):
-        return redirect_with_message(
-            "/portal",
-            "Enter a valid recipient username.",
-        )
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", recipient):
+        return redirect_message("/portal", "Enter a valid recipient username.")
 
-    if not math.isfinite(amount) or amount <= 0 or amount > 100_000_000:
-        return redirect_with_message(
-            "/portal",
-            "Enter a valid transfer amount.",
-        )
+    if not math.isfinite(amount) or amount <= 0 or amount > MAX_TRANSFER:
+        return redirect_message("/portal", "Enter a valid transfer amount.")
 
-    # Currency amounts should be handled with integer minor units
-    # in a production banking ledger. This demo stores REAL values.
     amount = round(amount, 2)
 
-    with get_connection() as db:
-        try:
-            db.execute("BEGIN IMMEDIATE")
+    if not re.fullmatch(r"\d{4}", input_pin):
+        return redirect_message("/portal", "Enter a valid four-digit PIN.")
 
-            sender = db.execute(
-                "SELECT * FROM users WHERE id = ?",
-                (user["id"],),
-            ).fetchone()
+    # Coordinates from the browser are optional and can be spoofed.
+    if valid_coordinates(live_lat, live_lon):
+        current_lat = float(live_lat)
+        current_lon = float(live_lon)
+    else:
+        current_lat = float(user["home_lat"])
+        current_lon = float(user["home_lon"])
 
-            target = db.execute(
-                "SELECT * FROM users WHERE username = ?",
-                (recipient,),
-            ).fetchone()
+    conn = get_connection()
 
-            if not sender:
-                db.rollback()
-                return RedirectResponse("/ui/login", status_code=303)
+    try:
+        # Lock the write transaction so concurrent transfers cannot
+        # spend the same balance at the same time.
+        conn.execute("BEGIN IMMEDIATE")
 
-            if not verify_secret(pin, sender["pin_hash"]):
-                db.rollback()
-                return redirect_with_message(
-                    "/portal",
-                    "The ATM PIN is incorrect.",
-                )
+        sender = conn.execute(
+            "SELECT * FROM users WHERE id = ?",
+            (user["id"],),
+        ).fetchone()
 
-            if not target:
-                db.rollback()
-                return redirect_with_message(
-                    "/portal",
-                    "Recipient account was not found.",
-                )
+        receiver = conn.execute(
+            "SELECT * FROM users WHERE username = ?",
+            (recipient,),
+        ).fetchone()
 
-            if target["id"] == sender["id"]:
-                db.rollback()
-                return redirect_with_message(
-                    "/portal",
-                    "You cannot transfer funds to your own account.",
-                )
+        if not sender:
+            conn.rollback()
+            return RedirectResponse("/ui/login", status_code=303)
 
-            if sender["balance"] < amount:
-                db.rollback()
-                return redirect_with_message(
-                    "/portal",
-                    "Insufficient available balance.",
-                )
+        if not receiver:
+            conn.rollback()
+            return redirect_message("/portal", "Recipient account not found.")
 
-            # Use browser coordinates only if they are valid.
-            # Browser coordinates are user-provided and are NOT
-            # reliable proof of a person's actual location.
-            if valid_coordinates(sender_lat, sender_lon):
-                tx_lat = float(sender_lat)
-                tx_lon = float(sender_lon)
-            else:
-                tx_lat = float(sender["home_lat"])
-                tx_lon = float(sender["home_lon"])
-
-            distance_km = calculate_gps_distance(
-                tx_lat,
-                tx_lon,
-                float(sender["home_lat"]),
-                float(sender["home_lon"]),
-            )
-
-            # Prefer the model score if the configured model works.
-            # Otherwise, use the clearly labelled rule-based fallback.
-            score = ml_risk_score(
-                amount,
-                distance_km,
-                float(sender["balance"]),
-            )
-
-            if score is None:
-                score, risk_reason = assess_transaction_risk(
-                    amount,
-                    distance_km,
-                    float(sender["balance"]),
-                )
-            else:
-                risk_reason = "ML model risk score"
-
-            # This threshold is only a demo setting and must be
-            # calibrated and validated before real-world use.
-            blocked = score >= 0.80
-
-            status = "blocked" if blocked else "completed"
-            reason = risk_reason if blocked else ""
-
-            db.execute(
-                """
-                INSERT INTO transactions (
-                    sender_id, recipient_id, amount, status, risk_score,
-                    reason, sender_lat, sender_lon, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    sender["id"],
-                    target["id"],
-                    amount,
-                    status,
-                    score,
-                    reason,
-                    tx_lat,
-                    tx_lon,
-                    now_iso(),
-                ),
-            )
-
-            if blocked:
-                # Do not update balances for blocked transfers.
-                db.commit()
-                return redirect_with_message(
-                    "/portal",
-                    "Transfer held for review by the fraud-monitoring system.",
-                )
-
-            debit = db.execute(
-                """
-                UPDATE users SET balance = balance - ?
-                WHERE id = ? AND balance >= ?
-                """,
-                (amount, sender["id"], amount),
-            )
-
-            if debit.rowcount != 1:
-                db.rollback()
-                return redirect_with_message(
-                    "/portal",
-                    "The transfer could not be completed. Please try again.",
-                )
-
-            db.execute(
-                "UPDATE users SET balance = balance + ? WHERE id = ?",
-                (amount, target["id"]),
-            )
-
-            db.commit()
-
-        except sqlite3.Error:
-            db.rollback()
-            logger.exception("Transaction failed")
-            return redirect_with_message(
+        if receiver["id"] == sender["id"]:
+            conn.rollback()
+            return redirect_message(
                 "/portal",
-                "A system error prevented the transfer. Please try again.",
+                "You cannot transfer funds to your own account.",
             )
 
-    return redirect_with_message(
-        "/portal",
-        "Transfer completed successfully.",
-    )
+        if not verify_secret(input_pin, sender["pin_hash"]):
+            conn.rollback()
+            return redirect_message("/portal", "Incorrect transaction PIN.")
+
+        if sender["balance"] < amount:
+            conn.rollback()
+            return redirect_message("/portal", "Insufficient available balance.")
+
+        home_distance = calculate_gps_distance(
+            sender["home_lat"],
+            sender["home_lon"],
+            current_lat,
+            current_lon,
+        )
+
+        last_tx = conn.execute(
+            """
+            SELECT sender_lat,sender_lon
+            FROM transactions
+            WHERE sender_id = ? AND status = 'Completed'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (sender["id"],),
+        ).fetchone()
+
+        if (
+            last_tx
+            and last_tx["sender_lat"] is not None
+            and last_tx["sender_lon"] is not None
+        ):
+            last_distance = calculate_gps_distance(
+                last_tx["sender_lat"],
+                last_tx["sender_lon"],
+                current_lat,
+                current_lon,
+            )
+        else:
+            last_distance = 0.0
+
+        risk_score, risk_reason = assess_risk(
+            amount,
+            home_distance,
+            last_distance,
+            sender["balance"],
+        )
+
+        # Demonstration threshold only; tune and validate before real use.
+        blocked = risk_score >= 0.80
+        tx_status = "Blocked" if blocked else "Completed"
+
+        conn.execute(
+            """
+            INSERT INTO transactions (
+                sender_id,recipient_id,amount,status,risk_score,reason,
+                sender_lat,sender_lon,created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                sender["id"],
+                receiver["id"],
+                amount,
+                tx_status,
+                risk_score,
+                risk_reason,
+                current_lat,
+                current_lon,
+                now_iso(),
+            ),
+        )
+
+        if blocked:
+            conn.commit()
+            return redirect_message(
+                "/portal",
+                "Transfer blocked for security review: " + risk_reason,
+            )
+
+        debit = conn.execute(
+            """
+            UPDATE users SET balance = balance - ?
+            WHERE id = ? AND balance >= ?
+            """,
+            (amount, sender["id"], amount),
+        )
+
+        if debit.rowcount != 1:
+            conn.rollback()
+            return redirect_message(
+                "/portal",
+                "Transfer could not be completed. Please try again.",
+            )
+
+        conn.execute(
+            "UPDATE users SET balance = balance + ? WHERE id = ?",
+            (amount, receiver["id"]),
+        )
+
+        conn.commit()
+
+    except sqlite3.Error:
+        conn.rollback()
+        logger.exception("Transfer processing failed")
+        return redirect_message(
+            "/portal",
+            "A database error prevented the transfer.",
+        )
+    finally:
+        conn.close()
+
+    return redirect_message("/portal", "Transfer completed successfully.")
 
 
-# ---------------------------------------------------------
+# =========================================================
 # MANAGER DASHBOARD
-# ---------------------------------------------------------
+# =========================================================
 
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(request: Request):
+def manager_dashboard_view(request: Request):
     user = get_session_user(request)
 
     if not user:
         return RedirectResponse("/ui/login", status_code=303)
 
     if user["role"] != "manager":
-        return RedirectResponse("/portal", status_code=303)
+        return HTMLResponse("Access denied.", status_code=403)
 
     with get_connection() as db:
         total_customers = db.execute(
             "SELECT COUNT(*) AS n FROM users WHERE role = 'customer'"
         ).fetchone()["n"]
 
-        total_balance = db.execute(
-            "SELECT COALESCE(SUM(balance), 0) AS n FROM users"
-        ).fetchone()["n"]
-
-        total_transactions = db.execute(
+        total_tx = db.execute(
             "SELECT COUNT(*) AS n FROM transactions"
         ).fetchone()["n"]
 
-        blocked_transactions = db.execute(
-            "SELECT COUNT(*) AS n FROM transactions WHERE status = 'blocked'"
+        blocked_tx = db.execute(
+            "SELECT COUNT(*) AS n FROM transactions WHERE status = 'Blocked'"
         ).fetchone()["n"]
 
-        latest = db.execute(
-            """
-            SELECT t.id, t.amount, t.status, t.risk_score, t.reason,
-                   t.created_at, s.username AS sender_name,
-                   r.username AS recipient_name
+        completed_tx = db.execute(
+            "SELECT COUNT(*) AS n FROM transactions WHERE status = 'Completed'"
+        ).fetchone()["n"]
+
+        total_balance = db.execute(
+            "SELECT COALESCE(SUM(balance),0) AS n FROM users WHERE role='customer'"
+        ).fetchone()["n"]
+
+        ledger = db.execute("""
+            SELECT t.id,t.created_at,t.amount,t.status,t.risk_score,t.reason,
+                   s.username AS sender,r.username AS receiver
             FROM transactions t
             JOIN users s ON s.id = t.sender_id
             JOIN users r ON r.id = t.recipient_id
-            ORDER BY t.id DESC
-            LIMIT 50
-            """
-        ).fetchall()
+            ORDER BY t.id DESC LIMIT 50
+        """).fetchall()
 
-        customers = db.execute(
-            """
-            SELECT id, username, balance, county, created_at
+        customers = db.execute("""
+            SELECT id,username,balance,county,created_at
             FROM users
             WHERE role = 'customer'
-            ORDER BY id DESC
-            LIMIT 50
-            """
-        ).fetchall()
+            ORDER BY id DESC LIMIT 50
+        """).fetchall()
 
-    transaction_rows = ""
-
-    for tx in latest:
-        transaction_rows += f"""
+    tx_rows = "".join(
+        f"""
         <tr>
-            <td>{tx['id']}</td>
-            <td>{esc(tx['sender_name'])}</td>
-            <td>{esc(tx['recipient_name'])}</td>
-            <td>{money(tx['amount'])}</td>
-            <td>{esc(tx['status'])}</td>
-            <td>{float(tx['risk_score']):.2f}</td>
-            <td>{esc(tx['reason'])}</td>
-            <td>{esc(tx['created_at'])}</td>
+          <td>{row['id']}</td>
+          <td>{esc(row['created_at'])}</td>
+          <td>{esc(row['sender'])}</td>
+          <td>{esc(row['receiver'])}</td>
+          <td>{money(row['amount'])}</td>
+          <td>{esc(row['status'])}</td>
+          <td>{float(row['risk_score']):.2f}</td>
+          <td>{esc(row['reason'])}</td>
         </tr>
         """
+        for row in ledger
+    ) or '<tr><td colspan="8">No transactions recorded.</td></tr>'
 
-    if not transaction_rows:
-        transaction_rows = '<tr><td colspan="8">No transactions recorded.</td></tr>'
-
-    customer_rows = ""
-
-    for customer in customers:
-        customer_rows += f"""
+    customer_rows = "".join(
+        f"""
         <tr>
-            <td>{customer['id']}</td>
-            <td>{esc(customer['username'])}</td>
-            <td>{money(customer['balance'])}</td>
-            <td>{esc(customer['county'])}</td>
-            <td>{esc(customer['created_at'])}</td>
+          <td>{row['id']}</td>
+          <td>{esc(row['username'])}</td>
+          <td>{money(row['balance'])}</td>
+          <td>{esc(row['county'])}</td>
+          <td>{esc(row['created_at'])}</td>
         </tr>
         """
+        for row in customers
+    ) or '<tr><td colspan="5">No customer accounts.</td></tr>'
 
-    if not customer_rows:
-        customer_rows = '<tr><td colspan="5">No customers registered.</td></tr>'
+    msg = message_from_request(request)
 
     body = f"""
-    <h1>Manager dashboard</h1>
-    {notice(message_from_request(request)) if message_from_request(request) else ""}
+    <h1>Central account management dashboard</h1>
+    {f'<div class="notice">{esc(msg)}</div>' if msg else ''}
 
     <section class="grid">
-        <div class="card">
-            <h3>Customers</h3>
-            <div class="balance">{total_customers:,}</div>
-        </div>
-        <div class="card">
-            <h3>Total customer balances</h3>
-            <div class="balance">{money(total_balance)}</div>
-        </div>
-        <div class="card">
-            <h3>Transactions</h3>
-            <div class="balance">{total_transactions:,}</div>
-        </div>
-        <div class="card">
-            <h3>Blocked transfers</h3>
-            <div class="balance">{blocked_transactions:,}</div>
-        </div>
+      <div class="card"><h3>Customers</h3>
+        <div class="balance">{total_customers:,}</div></div>
+      <div class="card"><h3>Customer balances</h3>
+        <div class="balance">{money(total_balance)}</div></div>
+      <div class="card"><h3>All transactions</h3>
+        <div class="balance">{total_tx:,}</div></div>
+      <div class="card"><h3>Completed transfers</h3>
+        <div class="balance">{completed_tx:,}</div></div>
+      <div class="card"><h3>Blocked transfers</h3>
+        <div class="balance">{blocked_tx:,}</div></div>
     </section>
 
     <section class="card">
-        <h2>Recent transactions</h2>
-        <div class="table-wrap">
-            <table>
-                <thead><tr>
-                    <th>ID</th><th>Sender</th><th>Recipient</th>
-                    <th>Amount</th><th>Status</th><th>Risk score</th>
-                    <th>Reason</th><th>Date</th>
-                </tr></thead>
-                <tbody>{transaction_rows}</tbody>
-            </table>
-        </div>
+      <h2>Transaction audit ledger</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>ID</th><th>Timestamp</th><th>Sender</th><th>Recipient</th>
+            <th>Amount</th><th>Status</th><th>Risk score</th><th>Reason</th>
+          </tr></thead>
+          <tbody>{tx_rows}</tbody>
+        </table>
+      </div>
     </section>
 
     <section class="card">
-        <h2>Recent customer accounts</h2>
-        <div class="table-wrap">
-            <table>
-                <thead><tr>
-                    <th>ID</th><th>Username</th><th>Balance</th>
-                    <th>County</th><th>Created</th>
-                </tr></thead>
-                <tbody>{customer_rows}</tbody>
-            </table>
-        </div>
+      <h2>Customer accounts</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>ID</th><th>Username</th><th>Balance</th>
+            <th>County</th><th>Created</th>
+          </tr></thead>
+          <tbody>{customer_rows}</tbody>
+        </table>
+      </div>
     </section>
     """
 
-    return page("Manager dashboard", body, user)
+    return render_page("Manager dashboard", body, user)
 
 
-# ---------------------------------------------------------
+# =========================================================
 # HEALTH CHECK
-# ---------------------------------------------------------
+# =========================================================
 
 @app.get("/health")
 def health():
@@ -1362,5 +1202,5 @@ def health():
         "status": "ok",
         "application": APP_NAME,
         "version": APP_VERSION,
-        "kenyan_counties": len(COUNTY_COORDINATES),
+        "county_count": len(COUNTY_COORDINATES),
     }
