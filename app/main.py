@@ -1,33 +1,40 @@
 
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from html import escape
 import math
 import os
-import sqlite3
+import re
+import html
+import json
+import logging
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Form, Request
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Depends,
+    Form,
+    Cookie,
+    status,
+)
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
 
-from app.database import init_db, get_db_connection
-from app.auth import hash_password, verify_password
 from app.model_service import FraudDetectionService
+from app.database import init_db, get_db_connection
+from app.auth import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    decode_access_token,
+)
 
-
-# ---------------------------------------------------------
-# CONFIGURATION
-# ---------------------------------------------------------
-
-COOKIE_NAME = "session_token"
-COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 fraud_service = None
 
 
-# ---------------------------------------------------------
-# APP LIFESPAN
-# ---------------------------------------------------------
+# =========================================================
+# UNIQUE BANK — APPLICATION STARTUP
+# =========================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -35,334 +42,413 @@ async def lifespan(app: FastAPI):
 
     init_db()
 
-    try:
-        fraud_service = FraudDetectionService()
-        print("Fraud detection model loaded successfully.")
-    except Exception as exc:
-        fraud_service = None
-        print(f"WARNING: Fraud model could not be loaded: {exc}")
+    # Create the initial manager only when credentials are configured.
+    # Never use a hard-coded default manager password.
+    admin_username = os.getenv("ADMIN_USERNAME")
+    admin_password = os.getenv("ADMIN_PASSWORD")
+
+    if admin_username and admin_password:
+        conn = get_db_connection()
+        try:
+            existing = conn.execute(
+                "SELECT username FROM users WHERE username = ?",
+                (admin_username,),
+            ).fetchone()
+
+            if not existing:
+                conn.execute(
+                    """
+                    INSERT INTO users
+                        (username, hashed_password, role, atm_pin, balance)
+                    VALUES (?, ?, 'manager', NULL, 5000.0)
+                    """,
+                    (admin_username, hash_password(admin_password)),
+                )
+                conn.commit()
+                logger.info("Unique Bank manager account provisioned.")
+        finally:
+            conn.close()
+
+    fraud_service = FraudDetectionService()
+    logger.info("Unique Bank fraud detection service initialized.")
 
     yield
 
+    logger.info("Unique Bank application shutting down.")
+
 
 app = FastAPI(
-    title="Trusted Bank Automated ML Hub",
-    description="Demo banking portal with machine-learning fraud detection.",
+    title="Unique Bank Automated ML Hub",
+    version="5.2.0",
     lifespan=lifespan,
 )
 
 
-# ---------------------------------------------------------
-# HTML HELPERS
-# ---------------------------------------------------------
+# =========================================================
+# SHARED HELPERS
+# =========================================================
 
-def page(title: str, content: str) -> HTMLResponse:
-    safe_title = escape(title)
-
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>{safe_title}</title>
-        <style>
-            * {{ box-sizing: border-box; }}
-            body {{
-                margin: 0;
-                padding: 24px;
-                font-family: Arial, sans-serif;
-                background: #f3f6fb;
-                color: #172033;
-            }}
-            .container {{
-                max-width: 1000px;
-                margin: 0 auto;
-            }}
-            .card {{
-                background: white;
-                padding: 24px;
-                margin-bottom: 20px;
-                border-radius: 14px;
-                box-shadow: 0 4px 18px rgba(0,0,0,.06);
-            }}
-            h1, h2 {{ margin-top: 0; }}
-            input, button {{
-                width: 100%;
-                padding: 12px;
-                margin: 7px 0 14px;
-                border: 1px solid #cbd5e1;
-                border-radius: 8px;
-                font-size: 15px;
-            }}
-            button {{
-                background: #1749a8;
-                color: white;
-                border: none;
-                cursor: pointer;
-                font-weight: bold;
-            }}
-            button:hover {{ background: #10377f; }}
-            a {{ color: #1749a8; }}
-            .nav {{
-                display: flex;
-                flex-wrap: wrap;
-                gap: 15px;
-                margin-bottom: 20px;
-            }}
-            .success {{ color: #087443; }}
-            .error {{ color: #b42318; }}
-            .muted {{ color: #64748b; }}
-            .table-wrap {{ overflow-x: auto; }}
-            table {{
-                width: 100%;
-                border-collapse: collapse;
-                min-width: 650px;
-            }}
-            th, td {{
-                padding: 10px;
-                border-bottom: 1px solid #e2e8f0;
-                text-align: left;
-            }}
-            th {{ background: #f8fafc; }}
-            .grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-                gap: 16px;
-            }}
-            .stat {{
-                padding: 16px;
-                background: #eff6ff;
-                border-radius: 10px;
-            }}
-            .stat strong {{
-                display: block;
-                font-size: 24px;
-                margin-top: 8px;
-            }}
-            @media (max-width: 600px) {{
-                body {{ padding: 12px; }}
-                .card {{ padding: 16px; }}
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            {content}
-        </div>
-    </body>
-    </html>
-    """
-    return HTMLResponse(html)
-
-
-def alert_redirect(message: str, path: str) -> HTMLResponse:
-    # Avoid inserting untrusted values directly into JavaScript.
-    import json
-
-    safe_message = json.dumps(message)
-    safe_path = json.dumps(path)
-
-    return HTMLResponse(
-        f"""
-        <script>
-            alert({safe_message});
-            window.location.href = {safe_path};
-        </script>
-        """
-    )
-
-
-def redirect(path: str) -> RedirectResponse:
-    return RedirectResponse(url=path, status_code=303)
-
-
-# ---------------------------------------------------------
-# DATABASE HELPERS
-# ---------------------------------------------------------
-
-def get_user_row(username: str):
-    conn = get_db_connection()
-    try:
-        return conn.execute(
-            "SELECT * FROM users WHERE username = ?",
-            (username,),
-        ).fetchone()
-    finally:
-        conn.close()
-
-
-def get_session_user(request: Request):
-    """
-    This function expects your existing auth module to provide
-    a way to decode and validate session_token.
-
-    Replace the body with your project's existing token-validation
-    function if it uses a different API.
-    """
-    token = request.cookies.get(COOKIE_NAME)
-
-    if not token:
+def get_session_user(
+    session_token: str | None = Cookie(default=None),
+):
+    if not session_token:
         return None
 
-    # If your app uses JWT, validate the token signature and expiry
-    # here. Never treat an unverified cookie as an authenticated user.
     try:
-        from app.auth import decode_access_token
-
-        payload = decode_access_token(token)
-        if not payload:
-            return None
-
-        username = payload.get("sub") or payload.get("username")
-        if not username:
-            return None
-
-        return get_user_row(username)
-
-    except (ImportError, AttributeError, ValueError, TypeError):
-        return None
+        return decode_access_token(session_token)
     except Exception:
         return None
 
 
-def require_manager(request: Request):
-    user = get_session_user(request)
-
-    if not user:
-        return redirect("/login")
-
-    if user["role"] != "manager":
-        return page(
-            "Access denied",
-            """
-            <div class="card">
-                <h1>Access denied</h1>
-                <p>You do not have permission to view the manager dashboard.</p>
-                <a href="/portal">Return to portal</a>
-            </div>
-            """,
-        )
-
-    return None
+def escape(value):
+    """Escape database values before rendering HTML."""
+    return html.escape(str(value if value is not None else ""))
 
 
-# ---------------------------------------------------------
-# GPS DISTANCE CALCULATION
-# ---------------------------------------------------------
+def alert_redirect(
+    message: str,
+    destination: str = "/portal",
+):
+    """Display a message and navigate to the specified page."""
+    return HTMLResponse(
+        "<!doctype html><html><body><script>"
+        f"alert({json.dumps(message)});"
+        f"window.location.href={json.dumps(destination)};"
+        "</script></body></html>"
+    )
 
-def calculate_gps_distance(
-    lat1: float,
-    lon1: float,
-    lat2: float,
-    lon2: float,
-) -> float:
-    """
-    Calculate distance between two GPS points in kilometres
-    using the Haversine formula.
-    """
-    earth_radius_km = 6371.0
 
-    lat1_rad = math.radians(lat1)
-    lat2_rad = math.radians(lat2)
+def calculate_gps_distance(lat1, lon1, lat2, lon2) -> float:
+    """Calculate the great-circle distance between two GPS coordinates."""
+    if None in (lat1, lon1, lat2, lon2):
+        return 0.0
 
-    delta_lat = math.radians(lat2 - lat1)
-    delta_lon = math.radians(lon2 - lon1)
+    lat1, lon1, lat2, lon2 = map(
+        math.radians, (lat1, lon1, lat2, lon2)
+    )
+
+    d_lat = lat2 - lat1
+    d_lon = lon2 - lon1
 
     a = (
-        math.sin(delta_lat / 2) ** 2
-        + math.cos(lat1_rad)
-        * math.cos(lat2_rad)
-        * math.sin(delta_lon / 2) ** 2
+        math.sin(d_lat / 2) ** 2
+        + math.cos(lat1)
+        * math.cos(lat2)
+        * math.sin(d_lon / 2) ** 2
     )
 
     a = max(0.0, min(1.0, a))
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-    return earth_radius_km * 2 * math.asin(math.sqrt(a))
+    return round(6371.0 * c, 2)
 
 
-# ---------------------------------------------------------
-# LANDING PAGE
-# ---------------------------------------------------------
+def valid_coordinates(lat, lon):
+    return (
+        math.isfinite(lat)
+        and math.isfinite(lon)
+        and -90 <= lat <= 90
+        and -180 <= lon <= 180
+    )
+
+
+def require_user(user):
+    if not user or not isinstance(user, str):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Please sign in again.",
+        )
+    return user
+
+
+def verify_pin(input_pin: str, stored_pin: str | None) -> bool:
+    """
+    Compatibility helper for existing databases with plaintext PINs.
+
+    For production, store PIN hashes and use a dedicated PIN-verification
+    function instead of plaintext comparison.
+    """
+    return bool(stored_pin) and input_pin == str(stored_pin)
+
+
+def render_page(title: str, body: str) -> str:
+    """Render a page using Unique Bank's shared layout."""
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{escape(title)}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+          rel="stylesheet">
+    <style>
+        body {{
+            background: #f3f6fb;
+            color: #172b4d;
+        }}
+        .navbar {{
+            background: #102a43;
+        }}
+        .card {{
+            border: 0;
+            border-radius: 14px;
+        }}
+        .brand {{
+            font-weight: 800;
+            letter-spacing: .4px;
+        }}
+        .table {{
+            vertical-align: middle;
+        }}
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-dark mb-4">
+        <div class="container">
+            <a class="navbar-brand brand" href="/">
+                🛡️ Unique Bank
+            </a>
+            <a class="btn btn-outline-light btn-sm" href="/auth/logout">
+                Sign out
+            </a>
+        </div>
+    </nav>
+    <main class="container pb-5">
+        {body}
+    </main>
+    <footer class="container text-center text-secondary pb-4">
+        <small>© Unique Bank — Intelligent Banking Security</small>
+    </footer>
+</body>
+</html>"""
+
+
+# =========================================================
+# HOME / LANDING PAGE
+# =========================================================
 
 @app.get("/", response_class=HTMLResponse)
-def home():
-    return page(
-        "Trusted Bank",
-        """
-        <div class="card">
-            <h1>Trusted Bank Automated ML Hub</h1>
-            <p>Banking demo with machine-learning fraud screening.</p>
-            <div class="nav">
-                <a href="/register">Create customer account</a>
-                <a href="/login">Login</a>
+async def home_portal(
+    user: str | None = Depends(get_session_user),
+):
+    if user:
+        conn = get_db_connection()
+        try:
+            profile = conn.execute(
+                "SELECT role FROM users WHERE username = ?",
+                (user,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if profile:
+            destination = (
+                "/dashboard"
+                if profile["role"] == "manager"
+                else "/portal"
+            )
+            return RedirectResponse(
+                destination,
+                status_code=status.HTTP_303_SEE_OTHER,
+            )
+
+    body = """
+    <div class="row justify-content-center align-items-center"
+         style="min-height:65vh">
+        <div class="col-lg-9">
+            <div class="card shadow-lg p-5 text-center">
+                <div class="display-1 mb-3">🛡️</div>
+                <h1 class="display-4 fw-bold mb-3">Unique Bank</h1>
+                <p class="lead text-secondary">
+                    Banking made smarter with GPS risk monitoring,
+                    intelligent transaction analysis, and machine-learning
+                    fraud detection.
+                </p>
+                <div class="d-flex flex-wrap gap-3 justify-content-center mt-4">
+                    <a href="/ui/login" class="btn btn-primary btn-lg px-4">
+                        Sign In
+                    </a>
+                    <a href="/ui/register" class="btn btn-warning btn-lg px-4">
+                        Open an Account
+                    </a>
+                </div>
+                <div class="row g-3 mt-4">
+                    <div class="col-md-4">
+                        <div class="border rounded p-3 h-100">
+                            <h5>🔐 Secure Access</h5>
+                            <p class="text-secondary mb-0">
+                                Authenticated banking sessions
+                            </p>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="border rounded p-3 h-100">
+                            <h5>📍 GPS Signals</h5>
+                            <p class="text-secondary mb-0">
+                                Location-based transaction features
+                            </p>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="border rounded p-3 h-100">
+                            <h5>🤖 ML Monitoring</h5>
+                            <p class="text-secondary mb-0">
+                                Automated fraud-risk evaluation
+                            </p>
+                        </div>
+                    </div>
+                </div>
             </div>
-            <p class="muted">
-                Demonstration only. Do not use this application to
-                store real banking credentials or transfer real money.
-            </p>
         </div>
-        """,
-    )
+    </div>
+    """
+
+    return render_page("Unique Bank | Welcome", body)
 
 
-# ---------------------------------------------------------
-# CUSTOMER REGISTRATION
-# ---------------------------------------------------------
+# =========================================================
+# REGISTRATION PAGE
+# =========================================================
 
-@app.get("/register", response_class=HTMLResponse)
-def register_page():
-    return page(
-        "Register",
-        """
-        <div class="card">
-            <h1>Create an account</h1>
-            <form method="post" action="/register">
-                <label>Username</label>
-                <input name="username" required minlength="3" maxlength="50">
+@app.get("/ui/register", response_class=HTMLResponse)
+async def view_register_form():
+    body = """
+    <div class="row justify-content-center">
+        <div class="col-md-8 col-lg-6">
+            <div class="card shadow p-4">
+                <h3>📝 Open a Unique Bank Account</h3>
+                <p class="text-secondary">
+                    Create your customer account.
+                </p>
+                <hr>
 
-                <label>Password</label>
-                <input type="password" name="password" required minlength="8">
+                <form action="/auth/register" method="post">
+                    <label class="form-label">Username</label>
+                    <input class="form-control mb-3"
+                           name="username"
+                           minlength="3"
+                           maxlength="50"
+                           autocomplete="username"
+                           required>
 
-                <label>ATM PIN (4-8 digits)</label>
-                <input
-                    type="password"
-                    name="atm_pin"
-                    required
-                    pattern="[0-9]{4,8}"
-                    inputmode="numeric"
-                >
+                    <label class="form-label">Password</label>
+                    <input class="form-control mb-3"
+                           type="password"
+                           name="password"
+                           minlength="12"
+                           autocomplete="new-password"
+                           required>
 
-                <label>Home latitude</label>
-                <input
-                    type="number"
-                    name="home_lat"
-                    min="-90"
-                    max="90"
-                    step="any"
-                    required
-                >
+                    <label class="form-label">4-Digit ATM PIN</label>
+                    <input class="form-control mb-3"
+                           type="password"
+                           name="atm_pin"
+                           inputmode="numeric"
+                           pattern="[0-9]{4}"
+                           maxlength="4"
+                           required>
 
-                <label>Home longitude</label>
-                <input
-                    type="number"
-                    name="home_lon"
-                    min="-180"
-                    max="180"
-                    step="any"
-                    required
-                >
+                    <div class="row">
+                        <div class="col-sm-6">
+                            <label class="form-label">Home Latitude</label>
+                            <input class="form-control mb-3"
+                                   type="number"
+                                   step="any"
+                                   min="-90"
+                                   max="90"
+                                   name="home_lat"
+                                   value="-1.2833"
+                                   required>
+                        </div>
+                        <div class="col-sm-6">
+                            <label class="form-label">Home Longitude</label>
+                            <input class="form-control mb-3"
+                                   type="number"
+                                   step="any"
+                                   min="-180"
+                                   max="180"
+                                   name="home_lon"
+                                   value="36.8167"
+                                   required>
+                        </div>
+                    </div>
 
-                <button type="submit">Register</button>
-            </form>
-            <a href="/login">Already have an account? Login</a>
+                    <button class="btn btn-success w-100 mt-2" type="submit">
+                        Create My Account
+                    </button>
+                </form>
+
+                <p class="text-center mt-3 mb-0">
+                    Already registered?
+                    <a href="/ui/login">Sign in</a>
+                </p>
+                <p class="text-center mt-2">
+                    <a href="/">Back to Unique Bank home</a>
+                </p>
+            </div>
         </div>
-        """,
-    )
+    </div>
+    """
+
+    return render_page("Unique Bank | Register", body)
 
 
-@app.post("/register", response_class=HTMLResponse)
-def register(
+# =========================================================
+# LOGIN PAGE
+# =========================================================
+
+@app.get("/ui/login", response_class=HTMLResponse)
+async def view_login_form():
+    body = """
+    <div class="row justify-content-center">
+        <div class="col-md-6 col-lg-5">
+            <div class="card shadow p-4">
+                <h3>🔑 Unique Bank Sign In</h3>
+                <p class="text-secondary">
+                    Access your secure banking portal.
+                </p>
+                <hr>
+
+                <form action="/auth/login" method="post">
+                    <label class="form-label">Username</label>
+                    <input class="form-control mb-3"
+                           name="username"
+                           autocomplete="username"
+                           required>
+
+                    <label class="form-label">Password</label>
+                    <input class="form-control mb-3"
+                           type="password"
+                           name="password"
+                           autocomplete="current-password"
+                           required>
+
+                    <button class="btn btn-primary w-100 mt-2" type="submit">
+                        Secure Login
+                    </button>
+                </form>
+
+                <p class="text-center mt-3 mb-0">
+                    New customer?
+                    <a href="/ui/register">Open an account</a>
+                </p>
+                <p class="text-center mt-2">
+                    <a href="/">Back to Unique Bank home</a>
+                </p>
+            </div>
+        </div>
+    </div>
+    """
+
+    return render_page("Unique Bank | Login", body)
+
+
+# =========================================================
+# REGISTER CUSTOMER
+# =========================================================
+
+@app.post("/auth/register")
+async def process_register(
     username: str = Form(...),
     password: str = Form(...),
     atm_pin: str = Form(...),
@@ -371,440 +457,492 @@ def register(
 ):
     username = username.strip()
 
-    if len(username) < 3 or len(username) > 50:
-        return alert_redirect("Username must be 3-50 characters.", "/register")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,50}", username):
+        return alert_redirect(
+            "Username must be 3–50 characters and contain only letters, "
+            "numbers, dots, underscores or hyphens.",
+            "/ui/register",
+        )
 
-    if len(password) < 8:
-        return alert_redirect("Password must be at least 8 characters.", "/register")
+    if len(password) < 12:
+        return alert_redirect(
+            "Please choose a password of at least 12 characters.",
+            "/ui/register",
+        )
 
-    if not atm_pin.isdigit() or not 4 <= len(atm_pin) <= 8:
-        return alert_redirect("ATM PIN must contain 4-8 digits.", "/register")
+    if not re.fullmatch(r"[0-9]{4}", atm_pin):
+        return alert_redirect(
+            "Your ATM PIN must contain exactly four digits.",
+            "/ui/register",
+        )
 
-    if not -90 <= home_lat <= 90 or not -180 <= home_lon <= 180:
-        return alert_redirect("Invalid home GPS coordinates.", "/register")
+    if not valid_coordinates(home_lat, home_lon):
+        return alert_redirect(
+            "Please provide valid GPS coordinates.",
+            "/ui/register",
+        )
 
     conn = get_db_connection()
 
     try:
-        existing = conn.execute(
-            "SELECT username FROM users WHERE username = ?",
-            (username,),
-        ).fetchone()
-
-        if existing:
-            return alert_redirect("Username is already registered.", "/register")
-
+        # Public registration always creates a customer.
+        # Manager accounts must be provisioned separately.
         conn.execute(
             """
             INSERT INTO users (
-                username,
-                hashed_password,
-                atm_pin,
-                home_lat,
-                home_lon,
-                role,
-                balance
+                username, hashed_password, atm_pin,
+                home_lat, home_lon, role
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'customer')
             """,
             (
                 username,
                 hash_password(password),
-                hash_password(atm_pin),
+                atm_pin,
                 home_lat,
                 home_lon,
-                "customer",
-                1000.00,
             ),
         )
 
         conn.commit()
 
-    except sqlite3.IntegrityError:
+    except Exception:
         conn.rollback()
-        return alert_redirect("Could not create account. Username may already exist.", "/register")
-    except sqlite3.Error:
-        conn.rollback()
-        return alert_redirect("Database error while registering.", "/register")
+        logger.exception("Unique Bank registration failed.")
+
+        return alert_redirect(
+            "Registration failed. The username may already exist.",
+            "/ui/register",
+        )
+
     finally:
         conn.close()
 
     return alert_redirect(
-        "Registration successful. You can now log in.",
-        "/login",
+        "Welcome to Unique Bank! Your account has been created.",
+        "/ui/login",
     )
 
 
-# ---------------------------------------------------------
-# LOGIN / LOGOUT
-# ---------------------------------------------------------
+# =========================================================
+# AUTHENTICATION
+# =========================================================
 
-@app.get("/login", response_class=HTMLResponse)
-def login_page():
-    return page(
-        "Login",
-        """
-        <div class="card">
-            <h1>Login</h1>
-            <form method="post" action="/login">
-                <label>Username</label>
-                <input name="username" required>
-
-                <label>Password</label>
-                <input type="password" name="password" required>
-
-                <button type="submit">Login</button>
-            </form>
-            <a href="/register">Create a customer account</a>
-        </div>
-        """,
-    )
-
-
-@app.post("/login", response_class=HTMLResponse)
-def login(
+@app.post("/auth/login")
+async def process_login(
     username: str = Form(...),
     password: str = Form(...),
 ):
-    user = get_user_row(username.strip())
+    username = username.strip()
 
-    if not user or not verify_password(password, user["hashed_password"]):
-        return alert_redirect("Invalid username or password.", "/login")
+    conn = get_db_connection()
 
-    # This assumes app.auth provides create_access_token(data).
-    # Use the token-creation function already defined in your auth.py.
     try:
-        from app.auth import create_access_token
-        token = create_access_token({"sub": user["username"]})
-    except (ImportError, AttributeError, TypeError):
+        row = conn.execute(
+            """
+            SELECT username, hashed_password, role
+            FROM users
+            WHERE username = ?
+            """,
+            (username,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if not row or not verify_password(password, row["hashed_password"]):
         return alert_redirect(
-            "Authentication token setup is incomplete. Check app/auth.py.",
-            "/login",
+            "Invalid username or password.",
+            "/ui/login",
         )
 
-    destination = "/manager" if user["role"] == "manager" else "/portal"
+    token = create_access_token(row["username"])
 
-    response = RedirectResponse(url=destination, status_code=303)
+    destination = (
+        "/dashboard"
+        if row["role"] == "manager"
+        else "/portal"
+    )
+
+    response = RedirectResponse(
+        destination,
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
     response.set_cookie(
-        key=COOKIE_NAME,
+        key="session_token",
         value=token,
         httponly=True,
-        secure=COOKIE_SECURE,
+        secure=os.getenv("COOKIE_SECURE", "false").lower() == "true",
         samesite="lax",
-        max_age=60 * 60,
+        max_age=3600,
         path="/",
     )
 
     return response
 
 
-@app.get("/logout")
-def logout():
-    response = RedirectResponse(url="/", status_code=303)
-    response.delete_cookie(COOKIE_NAME, path="/")
+@app.get("/auth/logout")
+async def logout():
+    response = RedirectResponse(
+        "/",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+    response.delete_cookie(
+        key="session_token",
+        path="/",
+    )
+
     return response
 
 
-# ---------------------------------------------------------
-# CUSTOMER PORTAL
-# ---------------------------------------------------------
+# =========================================================
+# CUSTOMER BANKING PORTAL
+# =========================================================
 
 @app.get("/portal", response_class=HTMLResponse)
-def customer_portal(request: Request):
-    user = get_session_user(request)
-
+async def customer_banking_portal(
+    user: str | None = Depends(get_session_user),
+):
     if not user:
-        return redirect("/login")
-
-    if user["role"] == "manager":
-        return redirect("/manager")
-
-    username = escape(user["username"])
-    balance = float(user["balance"])
-    home_lat = float(user["home_lat"])
-    home_lon = float(user["home_lon"])
+        return RedirectResponse("/ui/login")
 
     conn = get_db_connection()
 
     try:
-        transactions = conn.execute(
+        profile = conn.execute(
             """
-            SELECT *
+            SELECT balance, home_lat, home_lon
+            FROM users
+            WHERE username = ?
+            """,
+            (user,),
+        ).fetchone()
+
+        if not profile:
+            return RedirectResponse("/auth/logout")
+
+        ledger = conn.execute(
+            """
+            SELECT timestamp, recipient, amount,
+                   distance_from_home,
+                   distance_from_last_transaction,
+                   fraud_prediction, decision
             FROM transactions
             WHERE username = ?
             ORDER BY timestamp DESC
-            LIMIT 20
+            LIMIT 10
             """,
-            (user["username"],),
+            (user,),
         ).fetchall()
+
     finally:
         conn.close()
 
-    transaction_rows = ""
+    rows = ""
 
-    for tx in transactions:
-        tx_username = escape(str(tx["username"]))
-        recipient = escape(str(tx["recipient"]))
-        decision = escape(str(tx["decision"]))
-        risk_level = escape(str(tx["risk_level"]))
-        timestamp = escape(str(tx["timestamp"]))
+    for tx in ledger:
+        badge_class = (
+            "danger"
+            if tx["fraud_prediction"] == 1
+            else "success"
+        )
 
-        transaction_rows += f"""
+        rows += f"""
         <tr>
-            <td>{timestamp}</td>
-            <td>{tx_username}</td>
-            <td>{recipient}</td>
-            <td>{float(tx["amount"]):.2f}</td>
-            <td>{decision}</td>
-            <td>{risk_level}</td>
+            <td>{escape(tx['timestamp'])}</td>
+            <td>{escape(tx['recipient'])}</td>
+            <td>${float(tx['amount']):,.2f}</td>
+            <td>{float(tx['distance_from_home'] or 0):.2f} km</td>
+            <td>{float(tx['distance_from_last_transaction'] or 0):.2f} km</td>
+            <td>
+                <span class="badge bg-{badge_class}">
+                    {escape(tx['decision'])}
+                </span>
+            </td>
         </tr>
         """
 
-    if not transaction_rows:
-        transaction_rows = """
-        <tr><td colspan="6">No transactions recorded yet.</td></tr>
+    if not rows:
+        rows = """
+        <tr>
+            <td colspan="6" class="text-center text-secondary">
+                No transactions recorded yet.
+            </td>
+        </tr>
         """
 
-    content = f"""
-    <div class="nav">
-        <a href="/">Home</a>
-        <a href="/logout">Logout</a>
+    body = f"""
+    <div class="d-flex flex-wrap justify-content-between
+                align-items-center mb-4">
+        <div>
+            <h2>🏦 Unique Bank Customer Hub</h2>
+            <p class="text-secondary mb-0">
+                Welcome, {escape(user)}
+            </p>
+        </div>
+        <a class="btn btn-outline-danger" href="/auth/logout">
+            Disconnect Session
+        </a>
     </div>
 
-    <div class="card">
-        <h1>Welcome, {username}</h1>
-        <div class="grid">
-            <div class="stat">
-                Available demo balance
-                <strong>{balance:,.2f}</strong>
+    <div class="row g-3 mb-4">
+        <div class="col-md-6">
+            <div class="card shadow-sm p-4 h-100">
+                <p class="text-secondary mb-1">Available Balance</p>
+                <h2 class="fw-bold">
+                    ${float(profile['balance'] or 0):,.2f}
+                </h2>
             </div>
-            <div class="stat">
-                Home latitude
-                <strong>{home_lat:.5f}</strong>
-            </div>
-            <div class="stat">
-                Home longitude
-                <strong>{home_lon:.5f}</strong>
+        </div>
+
+        <div class="col-md-6">
+            <div class="card shadow-sm p-4 h-100">
+                <p class="text-secondary mb-1">Registered Home GPS</p>
+                <div><strong>Latitude:</strong> {profile['home_lat']}</div>
+                <div><strong>Longitude:</strong> {profile['home_lon']}</div>
             </div>
         </div>
     </div>
 
-    <div class="card">
-        <h2>Make a transfer</h2>
-        <p class="muted">
-            Allow location access to include your current GPS coordinates
-            in the transaction risk assessment.
+    <div class="card shadow-sm p-4 mb-4">
+        <h4>💸 Autonomous Smart Transfer</h4>
+        <p class="text-secondary">
+            Submit your transfer for machine-learning risk assessment.
         </p>
 
-        <form method="post" action="/portal/transact" id="transferForm">
-            <label>Recipient username</label>
-            <input name="recipient" required maxlength="50">
+        <form id="payment_form"
+              action="/portal/transact"
+              method="post"
+              onsubmit="return captureLocation(event)">
 
-            <label>Amount</label>
-            <input
-                type="number"
-                name="amount"
-                min="0.01"
-                step="0.01"
-                required
-            >
+            <div class="row g-3">
+                <div class="col-md-6">
+                    <label class="form-label">Recipient Username</label>
+                    <input class="form-control"
+                           name="recipient"
+                           maxlength="50"
+                           required>
+                </div>
 
-            <label>Ratio to median purchase price</label>
-            <input
-                type="number"
-                name="ratio_to_median_purchase_price"
-                min="0"
-                step="any"
-                value="1.0"
-                required
-            >
+                <div class="col-md-6">
+                    <label class="form-label">Transfer Amount ($)</label>
+                    <input class="form-control"
+                           name="amount"
+                           type="number"
+                           min="0.01"
+                           step="0.01"
+                           required>
+                </div>
 
-            <label>ATM PIN</label>
-            <input
-                type="password"
-                name="atm_pin"
-                inputmode="numeric"
-                required
-            >
+                <div class="col-md-6">
+                    <label class="form-label">
+                        Purchase Price Anomaly Ratio
+                    </label>
+                    <input class="form-control"
+                           name="ratio_to_median_purchase_price"
+                           type="number"
+                           min="0"
+                           step="any"
+                           value="1"
+                           required>
+                </div>
 
-            <input type="hidden" name="tx_lat" id="tx_lat">
-            <input type="hidden" name="tx_lon" id="tx_lon">
+                <div class="col-md-6">
+                    <label class="form-label">Secure ATM PIN</label>
+                    <input class="form-control"
+                           name="input_pin"
+                           type="password"
+                           inputmode="numeric"
+                           pattern="[0-9]{{4}}"
+                           maxlength="4"
+                           required>
+                </div>
+            </div>
 
-            <button type="button" id="gpsButton">Capture current GPS</button>
-            <p id="gpsStatus" class="muted">GPS has not been captured.</p>
+            <input type="hidden" id="live_lat" name="live_lat">
+            <input type="hidden" id="live_lon" name="live_lon">
 
-            <button type="submit">Submit transfer</button>
+            <button class="btn btn-primary mt-4" type="submit">
+                📍 Scan GPS and Authorize Transfer
+            </button>
         </form>
     </div>
 
-    <div class="card">
-        <h2>Recent transactions</h2>
-        <div class="table-wrap">
-            <table>
+    <div class="card shadow-sm p-4">
+        <h4>📋 Real-Time Activity Log</h4>
+
+        <div class="table-responsive">
+            <table class="table table-hover">
                 <thead>
                     <tr>
                         <th>Timestamp</th>
-                        <th>Sender</th>
                         <th>Recipient</th>
                         <th>Amount</th>
+                        <th>Home Radius</th>
+                        <th>Velocity Radius</th>
                         <th>Decision</th>
-                        <th>Risk</th>
                     </tr>
                 </thead>
-                <tbody>{transaction_rows}</tbody>
+                <tbody>{rows}</tbody>
             </table>
         </div>
     </div>
 
     <script>
-        const gpsButton = document.getElementById("gpsButton");
-        const gpsStatus = document.getElementById("gpsStatus");
+    function captureLocation(event) {{
+        event.preventDefault();
 
-        gpsButton.addEventListener("click", function () {{
-            if (!navigator.geolocation) {{
-                gpsStatus.textContent = "Geolocation is not supported by this browser.";
-                return;
-            }}
+        const form = document.getElementById("payment_form");
 
-            gpsStatus.textContent = "Getting location...";
-
-            navigator.geolocation.getCurrentPosition(
-                function (position) {{
-                    document.getElementById("tx_lat").value =
-                        position.coords.latitude;
-                    document.getElementById("tx_lon").value =
-                        position.coords.longitude;
-
-                    gpsStatus.textContent = "GPS captured.";
-                }},
-                function (error) {{
-                    gpsStatus.textContent =
-                        "Could not get GPS: " + error.message;
-                }},
-                {{
-                    enableHighAccuracy: true,
-                    timeout: 10000,
-                    maximumAge: 0
-                }}
+        if (!navigator.geolocation) {{
+            alert(
+                "GPS is unavailable. Your registered home location "
+                + "will be used."
             );
-        }});
+            form.submit();
+            return false;
+        }}
+
+        navigator.geolocation.getCurrentPosition(
+            function(position) {{
+                document.getElementById("live_lat").value =
+                    position.coords.latitude;
+
+                document.getElementById("live_lon").value =
+                    position.coords.longitude;
+
+                form.submit();
+            }},
+            function() {{
+                alert(
+                    "GPS permission was denied or unavailable. "
+                    + "Your registered home location will be used."
+                );
+                form.submit();
+            }},
+            {{
+                enableHighAccuracy: true,
+                timeout: 10000,
+                maximumAge: 0
+            }}
+        );
+
+        return false;
+    }}
     </script>
     """
 
-    return page("Customer Portal", content)
+    return render_page("Unique Bank | Customer Portal", body)
 
 
-# ---------------------------------------------------------
-# PROCESS TRANSACTION
-# ---------------------------------------------------------
+# =========================================================
+# TRANSACTION PROCESSING AND ML FRAUD DETECTION
+# =========================================================
 
-@app.post("/portal/transact", response_class=HTMLResponse)
-def process_transaction(
-    request: Request,
+@app.post("/portal/transact")
+async def process_transaction(
     recipient: str = Form(...),
     amount: float = Form(...),
     ratio_to_median_purchase_price: float = Form(...),
-    atm_pin: str = Form(...),
-    tx_lat: float = Form(...),
-    tx_lon: float = Form(...),
+    input_pin: str = Form(...),
+    live_lat: str | None = Form(default=None),
+    live_lon: str | None = Form(default=None),
+    user: str | None = Depends(get_session_user),
 ):
-    user = get_session_user(request)
+    user = require_user(user)
 
-    if not user:
-        return redirect("/login")
-
-    if user["role"] != "customer":
-        return alert_redirect("Only customer accounts can transfer funds.", "/portal")
-
-    sender_username = user["username"]
-    recipient = recipient.strip()
-
-    if not recipient or recipient == sender_username:
-        return alert_redirect(
-            "Please enter a valid recipient other than yourself.",
-            "/portal",
-        )
-
+    # Validate the transaction before accessing the account balances.
     if not math.isfinite(amount) or amount <= 0:
-        return alert_redirect("Amount must be greater than zero.", "/portal")
+        return alert_redirect("Enter a valid transfer amount.")
 
     if (
         not math.isfinite(ratio_to_median_purchase_price)
         or ratio_to_median_purchase_price < 0
     ):
-        return alert_redirect("Invalid purchase-price ratio.", "/portal")
+        return alert_redirect("Enter a valid purchase price ratio.")
 
-    if (
-        not math.isfinite(tx_lat)
-        or not math.isfinite(tx_lon)
-        or not -90 <= tx_lat <= 90
-        or not -180 <= tx_lon <= 180
-    ):
+    if not re.fullmatch(r"[0-9]{4}", input_pin):
+        return alert_redirect("Enter a valid four-digit ATM PIN.")
+
+    recipient = recipient.strip()
+
+    if not recipient or recipient == user:
         return alert_redirect(
-            "Valid GPS coordinates are required. Capture your location and retry.",
-            "/portal",
+            "Please choose a valid recipient other than yourself."
         )
 
     if fraud_service is None:
+        logger.error("Unique Bank fraud detection service is unavailable.")
+
         return alert_redirect(
-            "Fraud model is unavailable. Transfer was not processed.",
-            "/portal",
+            "Security verification is unavailable. No transfer was made."
         )
 
     conn = get_db_connection()
 
     try:
-        # Start a write transaction so balance checks and updates are
-        # performed atomically for this transfer.
+        # Serialize SQLite transactions to avoid concurrent overspending.
         conn.execute("BEGIN IMMEDIATE")
 
-        # -------------------------------------------------
-        # 1. SENDER AND BALANCE VERIFICATION
-        # -------------------------------------------------
-
-        sender_profile = conn.execute(
+        sender = conn.execute(
             "SELECT * FROM users WHERE username = ?",
-            (sender_username,),
+            (user,),
         ).fetchone()
 
-        if not sender_profile or float(sender_profile["balance"]) < amount:
-            conn.rollback()
-            return alert_redirect(
-                "Transfer failed: insufficient wallet capital.",
-                "/portal",
-            )
-
-        # Verify the PIN against its stored password hash.
-        if not verify_password(atm_pin, sender_profile["atm_pin"]):
-            conn.rollback()
-            return alert_redirect("Incorrect ATM PIN.", "/portal")
-
-        # -------------------------------------------------
-        # 2. RECIPIENT VERIFICATION GUARD
-        # This is the guard requested in your screenshot.
-        # -------------------------------------------------
-
-        receiver_profile = conn.execute(
-            "SELECT * FROM users WHERE username = ?",
+        receiver = conn.execute(
+            "SELECT username FROM users WHERE username = ?",
             (recipient,),
         ).fetchone()
 
-        if not receiver_profile:
+        if not sender:
             conn.rollback()
-            return alert_redirect(
-                "Transfer failed: the recipient account does not exist.",
-                "/portal",
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Account not found.",
             )
 
-        # -------------------------------------------------
-        # 3. GPS FEATURES FOR THE ML MODEL
-        # -------------------------------------------------
+        if not receiver:
+            conn.rollback()
+            return alert_redirect("Transfer failed: recipient not found.")
 
-        home_distance = calculate_gps_distance(
-            float(sender_profile["home_lat"]),
-            float(sender_profile["home_lon"]),
-            tx_lat,
-            tx_lon,
+        if (
+            sender["balance"] is None
+            or sender["balance"] < amount
+        ):
+            conn.rollback()
+            return alert_redirect("Insufficient account balance.")
+
+        if not verify_pin(input_pin, sender["atm_pin"]):
+            conn.rollback()
+            return alert_redirect("Incorrect ATM PIN.")
+
+        # Parse GPS coordinates. Fall back to registered coordinates
+        # if the browser did not supply valid values.
+        try:
+            current_lat = (
+                float(live_lat)
+                if live_lat
+                else float(sender["home_lat"])
+            )
+            current_lon = (
+                float(live_lon)
+                if live_lon
+                else float(sender["home_lon"])
+            )
+        except (ValueError, TypeError):
+            current_lat = float(sender["home_lat"])
+            current_lon = float(sender["home_lon"])
+
+        if not valid_coordinates(current_lat, current_lon):
+            current_lat = float(sender["home_lat"])
+            current_lon = float(sender["home_lon"])
+
+        distance_home = calculate_gps_distance(
+            sender["home_lat"],
+            sender["home_lon"],
+            current_lat,
+            current_lon,
         )
 
         last_tx = conn.execute(
@@ -812,257 +950,227 @@ def process_transaction(
             SELECT tx_lat, tx_lon
             FROM transactions
             WHERE username = ?
-              AND tx_lat IS NOT NULL
-              AND tx_lon IS NOT NULL
-              AND decision = 'APPROVED'
             ORDER BY timestamp DESC
             LIMIT 1
             """,
-            (sender_username,),
+            (user,),
         ).fetchone()
 
-        if last_tx:
-            last_transaction_distance = calculate_gps_distance(
-                float(last_tx["tx_lat"]),
-                float(last_tx["tx_lon"]),
-                tx_lat,
-                tx_lon,
-            )
-        else:
-            last_transaction_distance = 0.0
-
-        # -------------------------------------------------
-        # 4. ML FRAUD PREDICTION
-        # Keep feature names aligned with training data.
-        # -------------------------------------------------
-
-        features = {
-            "distance_from_home": home_distance,
-            "distance_from_last_transaction": last_transaction_distance,
-            "ratio_to_median_purchase_price":
-                ratio_to_median_purchase_price,
-            "repeat_retailer": 1,
-            "used_chip": 1,
-            "used_pin_number": 1,
-            "online_order": 0,
-        }
-
-        prediction_result = fraud_service.predict(features)
-
-        # Supports a service returning either a dictionary or a
-        # boolean-like prediction. Adapt this block if your service
-        # returns a different documented structure.
-        if isinstance(prediction_result, dict):
-            fraud_prediction = int(
-                prediction_result.get(
-                    "fraud_prediction",
-                    prediction_result.get("is_fraud", 0),
-                )
-            )
-
-            fraud_probability = float(
-                prediction_result.get(
-                    "fraud_probability",
-                    prediction_result.get("probability", 0.0),
-                )
-            )
-
-            risk_level = str(
-                prediction_result.get(
-                    "risk_level",
-                    "HIGH" if fraud_prediction else "LOW",
-                )
-            ).upper()
-        else:
-            fraud_prediction = int(bool(prediction_result))
-            fraud_probability = float(fraud_prediction)
-            risk_level = "HIGH" if fraud_prediction else "LOW"
+        distance_last = 0.0
 
         if (
-            not math.isfinite(fraud_probability)
-            or not 0.0 <= fraud_probability <= 1.0
+            last_tx
+            and last_tx["tx_lat"] is not None
+            and last_tx["tx_lon"] is not None
         ):
-            raise ValueError("Fraud service returned an invalid probability.")
+            distance_last = calculate_gps_distance(
+                last_tx["tx_lat"],
+                last_tx["tx_lon"],
+                current_lat,
+                current_lon,
+            )
 
-        if fraud_prediction not in (0, 1):
-            raise ValueError("Fraud service returned an invalid prediction.")
+        # Match this payload to the features expected by your trained model.
+        class PayloadContainer:
+            def model_dump(self):
+                return {
+                    "distance_from_home": distance_home,
+                    "distance_from_last_transaction": distance_last,
+                    "ratio_to_median_purchase_price":
+                        ratio_to_median_purchase_price,
+                    "repeat_retailer": 1,
+                    "used_chip": 1,
+                    "used_pin_number": 1,
+                    "online_order": 0,
+                }
 
-        # -------------------------------------------------
-        # 5. APPROVE OR BLOCK THE TRANSFER
-        # -------------------------------------------------
+        # Fail closed if inference fails or returns invalid data.
+        try:
+            results = fraud_service.predict(PayloadContainer())
 
-        decision = "BLOCKED" if fraud_prediction else "APPROVED"
+            prediction = int(results["fraud_prediction"])
+            probability = float(results["fraud_probability"])
+            risk_level = str(results["risk_level"])
 
-        if decision == "APPROVED":
-            # Recheck both balances within the same DB transaction.
-            current_sender = conn.execute(
-                "SELECT balance FROM users WHERE username = ?",
-                (sender_username,),
-            ).fetchone()
+            if (
+                prediction not in (0, 1)
+                or not math.isfinite(probability)
+                or not 0 <= probability <= 1
+            ):
+                raise ValueError("Invalid fraud prediction response.")
 
-            if not current_sender or float(current_sender["balance"]) < amount:
-                conn.rollback()
-                return alert_redirect(
-                    "Transfer failed: insufficient wallet capital.",
-                    "/portal",
+        except Exception:
+            conn.rollback()
+            logger.exception("Unique Bank fraud inference failed.")
+
+            return alert_redirect(
+                "Security verification failed. No money was transferred."
+            )
+
+        # Blocked transactions are recorded without moving any money.
+        if prediction == 1:
+            conn.execute(
+                """
+                INSERT INTO transactions (
+                    username, recipient, amount,
+                    distance_from_home,
+                    distance_from_last_transaction,
+                    ratio_to_median_purchase_price,
+                    repeat_retailer, used_chip, used_pin_number,
+                    online_order, fraud_prediction,
+                    fraud_probability, risk_level, decision,
+                    tx_lat, tx_lon
                 )
-
-            conn.execute(
-                """
-                UPDATE users
-                SET balance = balance - ?
-                WHERE username = ?
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (amount, sender_username),
+                (
+                    user,
+                    recipient,
+                    amount,
+                    distance_home,
+                    distance_last,
+                    ratio_to_median_purchase_price,
+                    1,
+                    1,
+                    1,
+                    0,
+                    1,
+                    probability,
+                    risk_level,
+                    "Blocked",
+                    current_lat,
+                    current_lon,
+                ),
             )
 
-            conn.execute(
-                """
-                UPDATE users
-                SET balance = balance + ?
-                WHERE username = ?
-                """,
-                (amount, recipient),
+            conn.commit()
+
+            return alert_redirect(
+                f"Security blocked this transfer. Risk level: {risk_level}."
             )
 
-        timestamp = datetime.now(timezone.utc).isoformat()
+        # Debit and credit are committed together.
+        conn.execute(
+            """
+            UPDATE users
+            SET balance = balance - ?
+            WHERE username = ?
+            """,
+            (amount, user),
+        )
 
-        # -------------------------------------------------
-        # 6. SAVE THE AUDIT RECORD
-        # -------------------------------------------------
+        conn.execute(
+            """
+            UPDATE users
+            SET balance = balance + ?
+            WHERE username = ?
+            """,
+            (amount, recipient),
+        )
 
         conn.execute(
             """
             INSERT INTO transactions (
-                username,
-                recipient,
-                amount,
+                username, recipient, amount,
                 distance_from_home,
                 distance_from_last_transaction,
                 ratio_to_median_purchase_price,
-                repeat_retailer,
-                used_chip,
-                used_pin_number,
-                online_order,
-                fraud_prediction,
-                fraud_probability,
-                risk_level,
-                decision,
-                tx_lat,
-                tx_lon,
-                timestamp
+                repeat_retailer, used_chip, used_pin_number,
+                online_order, fraud_prediction,
+                fraud_probability, risk_level, decision,
+                tx_lat, tx_lon
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                sender_username,
+                user,
                 recipient,
                 amount,
-                home_distance,
-                last_transaction_distance,
+                distance_home,
+                distance_last,
                 ratio_to_median_purchase_price,
-                features["repeat_retailer"],
-                features["used_chip"],
-                features["used_pin_number"],
-                features["online_order"],
-                fraud_prediction,
-                fraud_probability,
+                1,
+                1,
+                1,
+                0,
+                0,
+                probability,
                 risk_level,
-                decision,
-                tx_lat,
-                tx_lon,
-                timestamp,
+                "Completed",
+                current_lat,
+                current_lon,
             ),
         )
 
         conn.commit()
 
-        if decision == "BLOCKED":
-            return alert_redirect(
-                (
-                    "Transfer blocked by the fraud detection model. "
-                    f"Risk level: {risk_level}; "
-                    f"model probability: {fraud_probability:.1%}."
-                ),
-                "/portal",
-            )
-
         return alert_redirect(
-            (
-                "Transfer approved. "
-                f"Amount: {amount:.2f}; "
-                f"recipient: {recipient}; "
-                f"risk level: {risk_level}."
-            ),
-            "/portal",
+            "Unique Bank: Your transfer was completed successfully."
         )
 
-    except (sqlite3.Error, ValueError, TypeError, KeyError) as exc:
+    except HTTPException:
+        raise
+
+    except Exception:
         conn.rollback()
-        print(f"Transaction processing error: {exc}")
+        logger.exception("Unique Bank transaction failed.")
 
         return alert_redirect(
-            "The transfer could not be processed. No transfer was confirmed.",
-            "/portal",
-        )
-
-    except Exception as exc:
-        conn.rollback()
-        print(f"Unexpected transaction error: {exc}")
-
-        return alert_redirect(
-            "An unexpected error occurred. Please try again.",
-            "/portal",
+            "The transfer could not be completed. Please try again."
         )
 
     finally:
         conn.close()
 
 
-# ---------------------------------------------------------
-# MANAGER DASHBOARD
-# ---------------------------------------------------------
+# =========================================================
+# MANAGER RISK MONITORING DASHBOARD
+# =========================================================
 
-@app.get("/manager", response_class=HTMLResponse)
-def manager_dashboard(request: Request):
-    denial = require_manager(request)
-
-    if denial is not None:
-        return denial
+@app.get("/dashboard", response_class=HTMLResponse)
+async def manager_dashboard_view(
+    user: str | None = Depends(get_session_user),
+):
+    if not user:
+        return RedirectResponse("/ui/login")
 
     conn = get_db_connection()
 
     try:
-        total_users = conn.execute(
-            "SELECT COUNT(*) AS count FROM users"
-        ).fetchone()["count"]
+        role_check = conn.execute(
+            "SELECT role FROM users WHERE username = ?",
+            (user,),
+        ).fetchone()
 
-        total_transactions = conn.execute(
-            "SELECT COUNT(*) AS count FROM transactions"
-        ).fetchone()["count"]
+        if not role_check or role_check["role"] != "manager":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Manager authentication required.",
+            )
 
-        blocked_transactions = conn.execute(
+        total_tx = conn.execute(
             """
-            SELECT COUNT(*) AS count
+            SELECT COUNT(*) AS total
             FROM transactions
-            WHERE decision = 'BLOCKED'
             """
-        ).fetchone()["count"]
+        ).fetchone()["total"]
 
-        approved_transactions = conn.execute(
+        fraud_tx = conn.execute(
             """
-            SELECT COUNT(*) AS count
+            SELECT COUNT(*) AS fraud
             FROM transactions
-            WHERE decision = 'APPROVED'
+            WHERE fraud_prediction = 1
             """
-        ).fetchone()["count"]
+        ).fetchone()["fraud"]
 
-        recent_transactions = conn.execute(
+        ledger = conn.execute(
             """
-            SELECT *
+            SELECT timestamp, username, recipient, amount,
+                   distance_from_home, fraud_prediction,
+                   decision, risk_level, fraud_probability
             FROM transactions
             ORDER BY timestamp DESC
-            LIMIT 100
+            LIMIT 20
             """
         ).fetchall()
 
@@ -1071,63 +1179,88 @@ def manager_dashboard(request: Request):
 
     rows = ""
 
-    for tx in recent_transactions:
+    for tx in ledger:
+        badge_class = (
+            "danger"
+            if tx["fraud_prediction"] == 1
+            else "success"
+        )
+
         rows += f"""
         <tr>
-            <td>{escape(str(tx["timestamp"]))}</td>
-            <td>{escape(str(tx["username"]))}</td>
-            <td>{escape(str(tx["recipient"]))}</td>
-            <td>{float(tx["amount"]):.2f}</td>
-            <td>{escape(str(tx["decision"]))}</td>
-            <td>{escape(str(tx["risk_level"]))}</td>
-            <td>{float(tx["fraud_probability"]):.1%}</td>
+            <td>{escape(tx['timestamp'])}</td>
+            <td>{escape(tx['username'])}</td>
+            <td>{escape(tx['recipient'])}</td>
+            <td>${float(tx['amount']):,.2f}</td>
+            <td>{float(tx['distance_from_home'] or 0):.2f} km</td>
+            <td>
+                <span class="badge bg-{badge_class}">
+                    {escape(tx['decision'])}
+                </span>
+            </td>
+            <td>{escape(tx['risk_level'])}</td>
+            <td>{float(tx['fraud_probability'] or 0):.2%}</td>
         </tr>
         """
 
     if not rows:
-        rows = '<tr><td colspan="7">No transactions found.</td></tr>'
+        rows = """
+        <tr>
+            <td colspan="8" class="text-center text-secondary">
+                No transactions recorded yet.
+            </td>
+        </tr>
+        """
 
-    content = f"""
-    <div class="nav">
-        <a href="/">Home</a>
-        <a href="/logout">Logout</a>
+    body = f"""
+    <div class="d-flex flex-wrap justify-content-between
+                align-items-center mb-4">
+        <div>
+            <h2>🛡️ Unique Bank Control Center</h2>
+            <p class="text-secondary mb-0">
+                Manager: {escape(user)}
+            </p>
+        </div>
+        <a class="btn btn-outline-danger" href="/auth/logout">
+            Disconnect Session
+        </a>
     </div>
 
-    <div class="card">
-        <h1>Manager dashboard</h1>
-        <div class="grid">
-            <div class="stat">
-                Registered users
-                <strong>{total_users}</strong>
+    <div class="row g-3 mb-4">
+        <div class="col-md-6">
+            <div class="card shadow-sm p-4">
+                <p class="text-secondary mb-1">
+                    Total Inspected Transactions
+                </p>
+                <h2>{total_tx:,}</h2>
             </div>
-            <div class="stat">
-                Total transactions
-                <strong>{total_transactions}</strong>
-            </div>
-            <div class="stat">
-                Approved
-                <strong>{approved_transactions}</strong>
-            </div>
-            <div class="stat">
-                Blocked
-                <strong>{blocked_transactions}</strong>
+        </div>
+
+        <div class="col-md-6">
+            <div class="card shadow-sm p-4">
+                <p class="text-secondary mb-1">
+                    Intercepted High-Risk Transactions
+                </p>
+                <h2 class="text-danger">{fraud_tx:,}</h2>
             </div>
         </div>
     </div>
 
-    <div class="card">
-        <h2>Recent risk ledger</h2>
-        <div class="table-wrap">
-            <table>
+    <div class="card shadow-sm p-4">
+        <h4>📋 Central Processing Risk Ledger</h4>
+
+        <div class="table-responsive">
+            <table class="table table-hover">
                 <thead>
                     <tr>
                         <th>Timestamp</th>
                         <th>Sender</th>
                         <th>Recipient</th>
-                        <th>Amount</th>
+                        <th>Value</th>
+                        <th>Home Offset</th>
                         <th>Decision</th>
-                        <th>Risk level</th>
-                        <th>Fraud probability</th>
+                        <th>Risk Level</th>
+                        <th>Threat Probability</th>
                     </tr>
                 </thead>
                 <tbody>{rows}</tbody>
@@ -1136,16 +1269,4 @@ def manager_dashboard(request: Request):
     </div>
     """
 
-    return page("Manager Dashboard", content)
-
-
-# ---------------------------------------------------------
-# HEALTH CHECK
-# ---------------------------------------------------------
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "model_loaded": fraud_service is not None,
-    }
+    return render_page("Unique Bank | Manager Dashboard", body)
