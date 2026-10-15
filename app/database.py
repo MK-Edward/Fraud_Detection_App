@@ -12,7 +12,7 @@ def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 🏦 Enhanced Users Table with modern role tags and security fields
+    # 🏦 Unique Bank Users Ledger
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -20,13 +20,14 @@ def init_db():
         hashed_password TEXT NOT NULL,
         role TEXT NOT NULL DEFAULT 'customer',
         balance REAL NOT NULL DEFAULT 5000.00,
+        home_city TEXT DEFAULT 'Nairobi',
         home_lat REAL DEFAULT -1.2833, 
         home_lon REAL DEFAULT 36.8167,
         atm_pin TEXT DEFAULT '1234'
     )
     """)
     
-    # 📋 Transactions Ledger matching your model parameters
+    # 📋 Unique Bank Transactions Registry
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,7 +53,7 @@ def init_db():
     
     conn.commit()
     conn.close()
-    print("💾 Trusted Bank database schemas successfully updated.")
+    print("💾 Unique Bank database setup successfully updated.")
 
 if __name__ == "__main__":
     init_db()
