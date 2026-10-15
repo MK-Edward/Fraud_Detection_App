@@ -12,7 +12,7 @@ def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Enhanced Users Table with Home GPS markers and a custom ATM security PIN
+    # 🏦 Enhanced Users Table with modern role tags and security fields
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,7 +26,7 @@ def init_db():
     )
     """)
     
-    # Transactions ledger tracking precise geographical latitude and longitude footprints
+    # 📋 Transactions Ledger matching your model parameters
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,7 +52,7 @@ def init_db():
     
     conn.commit()
     conn.close()
-    print("💾 Trusted Bank database setup successfully updated.")
+    print("💾 Trusted Bank database schemas successfully updated.")
 
 if __name__ == "__main__":
     init_db()
