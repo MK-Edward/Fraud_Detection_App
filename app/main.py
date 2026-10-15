@@ -1,7 +1,7 @@
 
-import math
 import os
 import re
+import math
 import html
 import json
 import logging
@@ -33,7 +33,23 @@ fraud_service = None
 
 
 # =========================================================
-# UNIQUE BANK — APPLICATION STARTUP
+# UNIQUE BANK: CITY COORDINATES
+# =========================================================
+
+CITY_COORDINATES = {
+    "Nairobi": {"lat": -1.2833, "lon": 36.8167},
+    "Mombasa": {"lat": -4.0544, "lon": 39.6631},
+    "Kisumu": {"lat": -0.1022, "lon": 34.7617},
+    "Nakuru": {"lat": -0.3031, "lon": 36.0800},
+    "Eldoret": {"lat": 0.5143, "lon": 35.2698},
+    "London": {"lat": 51.5074, "lon": -0.1278},
+    "New York": {"lat": 40.7128, "lon": -74.0060},
+    "Tokyo": {"lat": 35.6764, "lon": 139.6500},
+}
+
+
+# =========================================================
+# APPLICATION STARTUP
 # =========================================================
 
 @asynccontextmanager
@@ -42,8 +58,8 @@ async def lifespan(app: FastAPI):
 
     init_db()
 
-    # Create the initial manager only when credentials are configured.
-    # Never use a hard-coded default manager password.
+    # Provision a manager only when credentials are configured.
+    # Do not put production passwords directly in source code.
     admin_username = os.getenv("ADMIN_USERNAME")
     admin_password = os.getenv("ADMIN_PASSWORD")
 
@@ -58,28 +74,36 @@ async def lifespan(app: FastAPI):
             if not existing:
                 conn.execute(
                     """
-                    INSERT INTO users
-                        (username, hashed_password, role, atm_pin, balance)
-                    VALUES (?, ?, 'manager', NULL, 5000.0)
+                    INSERT INTO users (
+                        username, hashed_password, role, atm_pin,
+                        balance, home_city, home_lat, home_lon
+                    )
+                    VALUES (?, ?, 'manager', NULL, 5000.0, ?, ?, ?)
                     """,
-                    (admin_username, hash_password(admin_password)),
+                    (
+                        admin_username,
+                        hash_password(admin_password),
+                        "Nairobi",
+                        CITY_COORDINATES["Nairobi"]["lat"],
+                        CITY_COORDINATES["Nairobi"]["lon"],
+                    ),
                 )
                 conn.commit()
-                logger.info("Unique Bank manager account provisioned.")
+                logger.info("Unique Bank manager provisioned.")
         finally:
             conn.close()
 
     fraud_service = FraudDetectionService()
-    logger.info("Unique Bank fraud detection service initialized.")
+    logger.info("Unique Bank ML fraud detection service initialized.")
 
     yield
 
-    logger.info("Unique Bank application shutting down.")
+    logger.info("Unique Bank shutting down.")
 
 
 app = FastAPI(
     title="Unique Bank Automated ML Hub",
-    version="5.2.0",
+    version="6.1.0",
     lifespan=lifespan,
 )
 
@@ -101,7 +125,6 @@ def get_session_user(
 
 
 def escape(value):
-    """Escape database values before rendering HTML."""
     return html.escape(str(value if value is not None else ""))
 
 
@@ -109,7 +132,6 @@ def alert_redirect(
     message: str,
     destination: str = "/portal",
 ):
-    """Display a message and navigate to the specified page."""
     return HTMLResponse(
         "<!doctype html><html><body><script>"
         f"alert({json.dumps(message)});"
@@ -119,7 +141,7 @@ def alert_redirect(
 
 
 def calculate_gps_distance(lat1, lon1, lat2, lon2) -> float:
-    """Calculate the great-circle distance between two GPS coordinates."""
+    """Return the great-circle distance in kilometres."""
     if None in (lat1, lon1, lat2, lon2):
         return 0.0
 
@@ -152,27 +174,17 @@ def valid_coordinates(lat, lon):
     )
 
 
-def require_user(user):
-    if not user or not isinstance(user, str):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Please sign in again.",
-        )
-    return user
-
-
-def verify_pin(input_pin: str, stored_pin: str | None) -> bool:
+def verify_pin(input_pin, stored_pin):
     """
-    Compatibility helper for existing databases with plaintext PINs.
+    Legacy plaintext PIN compatibility.
 
-    For production, store PIN hashes and use a dedicated PIN-verification
-    function instead of plaintext comparison.
+    Replace this with hash verification after migrating existing PINs
+    to a secure, dedicated PIN-hashing scheme.
     """
-    return bool(stored_pin) and input_pin == str(stored_pin)
+    return stored_pin is not None and input_pin == str(stored_pin)
 
 
-def render_page(title: str, body: str) -> str:
-    """Render a page using Unique Bank's shared layout."""
+def render_page(title, body):
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -205,9 +217,7 @@ def render_page(title: str, body: str) -> str:
 <body>
     <nav class="navbar navbar-dark mb-4">
         <div class="container">
-            <a class="navbar-brand brand" href="/">
-                🛡️ Unique Bank
-            </a>
+            <a class="navbar-brand brand" href="/">🛡️ Unique Bank</a>
             <a class="btn btn-outline-light btn-sm" href="/auth/logout">
                 Sign out
             </a>
@@ -224,7 +234,7 @@ def render_page(title: str, body: str) -> str:
 
 
 # =========================================================
-# HOME / LANDING PAGE
+# HOME PAGE
 # =========================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -242,13 +252,13 @@ async def home_portal(
             conn.close()
 
         if profile:
-            destination = (
+            target = (
                 "/dashboard"
                 if profile["role"] == "manager"
                 else "/portal"
             )
             return RedirectResponse(
-                destination,
+                target,
                 status_code=status.HTTP_303_SEE_OTHER,
             )
 
@@ -258,18 +268,17 @@ async def home_portal(
         <div class="col-lg-9">
             <div class="card shadow-lg p-5 text-center">
                 <div class="display-1 mb-3">🛡️</div>
-                <h1 class="display-4 fw-bold mb-3">Unique Bank</h1>
-                <p class="lead text-secondary">
-                    Banking made smarter with GPS risk monitoring,
-                    intelligent transaction analysis, and machine-learning
-                    fraud detection.
+                <h1 class="display-4 fw-bold">Unique Bank</h1>
+                <p class="lead text-secondary mt-3">
+                    Smarter banking with city-based location profiles,
+                    GPS risk signals and machine-learning fraud detection.
                 </p>
                 <div class="d-flex flex-wrap gap-3 justify-content-center mt-4">
                     <a href="/ui/login" class="btn btn-primary btn-lg px-4">
-                        Sign In
+                        Sign In Portal
                     </a>
                     <a href="/ui/register" class="btn btn-warning btn-lg px-4">
-                        Open an Account
+                        Open Account
                     </a>
                 </div>
                 <div class="row g-3 mt-4">
@@ -277,23 +286,23 @@ async def home_portal(
                         <div class="border rounded p-3 h-100">
                             <h5>🔐 Secure Access</h5>
                             <p class="text-secondary mb-0">
-                                Authenticated banking sessions
+                                Authenticated account sessions
                             </p>
                         </div>
                     </div>
                     <div class="col-md-4">
                         <div class="border rounded p-3 h-100">
-                            <h5>📍 GPS Signals</h5>
+                            <h5>📍 GPS Monitoring</h5>
                             <p class="text-secondary mb-0">
-                                Location-based transaction features
+                                Location-based transaction signals
                             </p>
                         </div>
                     </div>
                     <div class="col-md-4">
                         <div class="border rounded p-3 h-100">
-                            <h5>🤖 ML Monitoring</h5>
+                            <h5>🤖 AI Fraud Shield</h5>
                             <p class="text-secondary mb-0">
-                                Automated fraud-risk evaluation
+                                Automated transaction risk assessment
                             </p>
                         </div>
                     </div>
@@ -303,7 +312,7 @@ async def home_portal(
     </div>
     """
 
-    return render_page("Unique Bank | Welcome", body)
+    return render_page("Unique Bank | Home", body)
 
 
 # =========================================================
@@ -312,13 +321,18 @@ async def home_portal(
 
 @app.get("/ui/register", response_class=HTMLResponse)
 async def view_register_form():
-    body = """
+    city_options = "".join(
+        f'<option value="{escape(city)}">{escape(city)}</option>'
+        for city in CITY_COORDINATES
+    )
+
+    body = f"""
     <div class="row justify-content-center">
-        <div class="col-md-8 col-lg-6">
+        <div class="col-md-7 col-lg-6">
             <div class="card shadow p-4">
-                <h3>📝 Open a Unique Bank Account</h3>
+                <h3>📝 Create a Unique Bank Account</h3>
                 <p class="text-secondary">
-                    Create your customer account.
+                    Choose your registered home city.
                 </p>
                 <hr>
 
@@ -339,42 +353,28 @@ async def view_register_form():
                            autocomplete="new-password"
                            required>
 
-                    <label class="form-label">4-Digit ATM PIN</label>
+                    <label class="form-label">4-Digit Security ATM PIN</label>
                     <input class="form-control mb-3"
                            type="password"
                            name="atm_pin"
                            inputmode="numeric"
-                           pattern="[0-9]{4}"
+                           pattern="[0-9]{{4}}"
                            maxlength="4"
                            required>
 
-                    <div class="row">
-                        <div class="col-sm-6">
-                            <label class="form-label">Home Latitude</label>
-                            <input class="form-control mb-3"
-                                   type="number"
-                                   step="any"
-                                   min="-90"
-                                   max="90"
-                                   name="home_lat"
-                                   value="-1.2833"
-                                   required>
-                        </div>
-                        <div class="col-sm-6">
-                            <label class="form-label">Home Longitude</label>
-                            <input class="form-control mb-3"
-                                   type="number"
-                                   step="any"
-                                   min="-180"
-                                   max="180"
-                                   name="home_lon"
-                                   value="36.8167"
-                                   required>
-                        </div>
-                    </div>
+                    <label class="form-label">Select Home City</label>
+                    <select name="home_city" class="form-select mb-3" required>
+                        {city_options}
+                    </select>
 
-                    <button class="btn btn-success w-100 mt-2" type="submit">
-                        Create My Account
+                    <p class="text-secondary small">
+                        GPS coordinates are assigned from the selected city.
+                        Your actual position may differ from the city centre.
+                    </p>
+
+                    <button type="submit"
+                            class="btn btn-success w-100 mt-2">
+                        Create Customer Account
                     </button>
                 </form>
 
@@ -383,7 +383,7 @@ async def view_register_form():
                     <a href="/ui/login">Sign in</a>
                 </p>
                 <p class="text-center mt-2">
-                    <a href="/">Back to Unique Bank home</a>
+                    <a href="/">Back to Unique Bank</a>
                 </p>
             </div>
         </div>
@@ -405,7 +405,7 @@ async def view_login_form():
             <div class="card shadow p-4">
                 <h3>🔑 Unique Bank Sign In</h3>
                 <p class="text-secondary">
-                    Access your secure banking portal.
+                    Access your secure banking account.
                 </p>
                 <hr>
 
@@ -423,7 +423,8 @@ async def view_login_form():
                            autocomplete="current-password"
                            required>
 
-                    <button class="btn btn-primary w-100 mt-2" type="submit">
+                    <button type="submit"
+                            class="btn btn-primary w-100 mt-2">
                         Secure Login
                     </button>
                 </form>
@@ -433,7 +434,7 @@ async def view_login_form():
                     <a href="/ui/register">Open an account</a>
                 </p>
                 <p class="text-center mt-2">
-                    <a href="/">Back to Unique Bank home</a>
+                    <a href="/">Back to Unique Bank</a>
                 </p>
             </div>
         </div>
@@ -444,7 +445,7 @@ async def view_login_form():
 
 
 # =========================================================
-# REGISTER CUSTOMER
+# CUSTOMER REGISTRATION
 # =========================================================
 
 @app.post("/auth/register")
@@ -452,21 +453,20 @@ async def process_register(
     username: str = Form(...),
     password: str = Form(...),
     atm_pin: str = Form(...),
-    home_lat: float = Form(...),
-    home_lon: float = Form(...),
+    home_city: str = Form(...),
 ):
     username = username.strip()
 
     if not re.fullmatch(r"[A-Za-z0-9_.-]{3,50}", username):
         return alert_redirect(
-            "Username must be 3–50 characters and contain only letters, "
-            "numbers, dots, underscores or hyphens.",
+            "Username must be 3–50 characters and use letters, numbers, "
+            "dots, underscores or hyphens.",
             "/ui/register",
         )
 
     if len(password) < 12:
         return alert_redirect(
-            "Please choose a password of at least 12 characters.",
+            "Choose a password with at least 12 characters.",
             "/ui/register",
         )
 
@@ -476,34 +476,35 @@ async def process_register(
             "/ui/register",
         )
 
-    if not valid_coordinates(home_lat, home_lon):
+    coords = CITY_COORDINATES.get(home_city)
+
+    if coords is None:
         return alert_redirect(
-            "Please provide valid GPS coordinates.",
+            "Please select a valid home city.",
             "/ui/register",
         )
 
     conn = get_db_connection()
 
     try:
-        # Public registration always creates a customer.
-        # Manager accounts must be provisioned separately.
+        # Public registration cannot assign manager privileges.
         conn.execute(
             """
             INSERT INTO users (
                 username, hashed_password, atm_pin,
-                home_lat, home_lon, role
+                home_city, home_lat, home_lon, role
             )
-            VALUES (?, ?, ?, ?, ?, 'customer')
+            VALUES (?, ?, ?, ?, ?, ?, 'customer')
             """,
             (
                 username,
                 hash_password(password),
                 atm_pin,
-                home_lat,
-                home_lon,
+                home_city,
+                coords["lat"],
+                coords["lon"],
             ),
         )
-
         conn.commit()
 
     except Exception:
@@ -511,7 +512,7 @@ async def process_register(
         logger.exception("Unique Bank registration failed.")
 
         return alert_redirect(
-            "Registration failed. The username may already exist.",
+            "Registration failed. Username may already exist.",
             "/ui/register",
         )
 
@@ -519,13 +520,13 @@ async def process_register(
         conn.close()
 
     return alert_redirect(
-        "Welcome to Unique Bank! Your account has been created.",
+        "Unique Bank account created successfully!",
         "/ui/login",
     )
 
 
 # =========================================================
-# AUTHENTICATION
+# LOGIN AND LOGOUT
 # =========================================================
 
 @app.post("/auth/login")
@@ -536,7 +537,6 @@ async def process_login(
     username = username.strip()
 
     conn = get_db_connection()
-
     try:
         row = conn.execute(
             """
@@ -557,14 +557,14 @@ async def process_login(
 
     token = create_access_token(row["username"])
 
-    destination = (
+    target = (
         "/dashboard"
         if row["role"] == "manager"
         else "/portal"
     )
 
     response = RedirectResponse(
-        destination,
+        target,
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -587,12 +587,7 @@ async def logout():
         "/",
         status_code=status.HTTP_303_SEE_OTHER,
     )
-
-    response.delete_cookie(
-        key="session_token",
-        path="/",
-    )
-
+    response.delete_cookie("session_token", path="/")
     return response
 
 
@@ -608,11 +603,10 @@ async def customer_banking_portal(
         return RedirectResponse("/ui/login")
 
     conn = get_db_connection()
-
     try:
         profile = conn.execute(
             """
-            SELECT balance, home_lat, home_lon
+            SELECT balance, home_city, home_lat, home_lon
             FROM users
             WHERE username = ?
             """,
@@ -635,7 +629,6 @@ async def customer_banking_portal(
             """,
             (user,),
         ).fetchall()
-
     finally:
         conn.close()
 
@@ -643,9 +636,7 @@ async def customer_banking_portal(
 
     for tx in ledger:
         badge_class = (
-            "danger"
-            if tx["fraud_prediction"] == 1
-            else "success"
+            "danger" if tx["fraud_prediction"] == 1 else "success"
         )
 
         rows += f"""
@@ -690,25 +681,23 @@ async def customer_banking_portal(
         <div class="col-md-6">
             <div class="card shadow-sm p-4 h-100">
                 <p class="text-secondary mb-1">Available Balance</p>
-                <h2 class="fw-bold">
-                    ${float(profile['balance'] or 0):,.2f}
-                </h2>
+                <h2>${float(profile['balance'] or 0):,.2f}</h2>
             </div>
         </div>
-
         <div class="col-md-6">
             <div class="card shadow-sm p-4 h-100">
-                <p class="text-secondary mb-1">Registered Home GPS</p>
-                <div><strong>Latitude:</strong> {profile['home_lat']}</div>
-                <div><strong>Longitude:</strong> {profile['home_lon']}</div>
+                <p class="text-secondary mb-1">Registered Home Base</p>
+                <h4>📍 {escape(profile['home_city'])}</h4>
+                <small>Latitude: {profile['home_lat']}</small><br>
+                <small>Longitude: {profile['home_lon']}</small>
             </div>
         </div>
     </div>
 
     <div class="card shadow-sm p-4 mb-4">
-        <h4>💸 Autonomous Smart Transfer</h4>
+        <h4>💸 Autonomous Smart Wire</h4>
         <p class="text-secondary">
-            Submit your transfer for machine-learning risk assessment.
+            Submit a transfer for machine-learning fraud-risk assessment.
         </p>
 
         <form id="payment_form"
@@ -724,7 +713,6 @@ async def customer_banking_portal(
                            maxlength="50"
                            required>
                 </div>
-
                 <div class="col-md-6">
                     <label class="form-label">Transfer Amount ($)</label>
                     <input class="form-control"
@@ -734,7 +722,6 @@ async def customer_banking_portal(
                            step="0.01"
                            required>
                 </div>
-
                 <div class="col-md-6">
                     <label class="form-label">
                         Purchase Price Anomaly Ratio
@@ -747,7 +734,6 @@ async def customer_banking_portal(
                            value="1"
                            required>
                 </div>
-
                 <div class="col-md-6">
                     <label class="form-label">Secure ATM PIN</label>
                     <input class="form-control"
@@ -764,19 +750,18 @@ async def customer_banking_portal(
             <input type="hidden" id="live_lon" name="live_lon">
 
             <button class="btn btn-primary mt-4" type="submit">
-                📍 Scan GPS and Authorize Transfer
+                📍 Scan GPS and Authorize Funds
             </button>
         </form>
     </div>
 
     <div class="card shadow-sm p-4">
         <h4>📋 Real-Time Activity Log</h4>
-
         <div class="table-responsive">
             <table class="table table-hover">
                 <thead>
                     <tr>
-                        <th>Timestamp</th>
+                        <th>Date</th>
                         <th>Recipient</th>
                         <th>Amount</th>
                         <th>Home Radius</th>
@@ -796,10 +781,7 @@ async def customer_banking_portal(
         const form = document.getElementById("payment_form");
 
         if (!navigator.geolocation) {{
-            alert(
-                "GPS is unavailable. Your registered home location "
-                + "will be used."
-            );
+            alert("GPS unavailable. Your registered city location will be used.");
             form.submit();
             return false;
         }}
@@ -808,16 +790,14 @@ async def customer_banking_portal(
             function(position) {{
                 document.getElementById("live_lat").value =
                     position.coords.latitude;
-
                 document.getElementById("live_lon").value =
                     position.coords.longitude;
-
                 form.submit();
             }},
             function() {{
                 alert(
-                    "GPS permission was denied or unavailable. "
-                    + "Your registered home location will be used."
+                    "GPS permission denied or unavailable. "
+                    + "Your registered city location will be used."
                 );
                 form.submit();
             }},
@@ -837,7 +817,7 @@ async def customer_banking_portal(
 
 
 # =========================================================
-# TRANSACTION PROCESSING AND ML FRAUD DETECTION
+# TRANSACTION PROCESSING AND FRAUD DETECTION
 # =========================================================
 
 @app.post("/portal/transact")
@@ -850,9 +830,12 @@ async def process_transaction(
     live_lon: str | None = Form(default=None),
     user: str | None = Depends(get_session_user),
 ):
-    user = require_user(user)
+    if not user or not isinstance(user, str):
+        raise HTTPException(
+            status_code=401,
+            detail="Session expired. Please sign in again.",
+        )
 
-    # Validate the transaction before accessing the account balances.
     if not math.isfinite(amount) or amount <= 0:
         return alert_redirect("Enter a valid transfer amount.")
 
@@ -860,7 +843,7 @@ async def process_transaction(
         not math.isfinite(ratio_to_median_purchase_price)
         or ratio_to_median_purchase_price < 0
     ):
-        return alert_redirect("Enter a valid purchase price ratio.")
+        return alert_redirect("Invalid purchase price anomaly ratio.")
 
     if not re.fullmatch(r"[0-9]{4}", input_pin):
         return alert_redirect("Enter a valid four-digit ATM PIN.")
@@ -869,20 +852,19 @@ async def process_transaction(
 
     if not recipient or recipient == user:
         return alert_redirect(
-            "Please choose a valid recipient other than yourself."
+            "Choose a valid recipient other than yourself."
         )
 
     if fraud_service is None:
-        logger.error("Unique Bank fraud detection service is unavailable.")
-
+        logger.error("Unique Bank ML service is unavailable.")
         return alert_redirect(
-            "Security verification is unavailable. No transfer was made."
+            "Security verification is unavailable. No funds were transferred."
         )
 
     conn = get_db_connection()
 
     try:
-        # Serialize SQLite transactions to avoid concurrent overspending.
+        # SQLite: serialize transactions to avoid concurrent overspending.
         conn.execute("BEGIN IMMEDIATE")
 
         sender = conn.execute(
@@ -898,27 +880,23 @@ async def process_transaction(
         if not sender:
             conn.rollback()
             raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Account not found.",
+                status_code=401,
+                detail="Sender account not found.",
             )
 
         if not receiver:
             conn.rollback()
             return alert_redirect("Transfer failed: recipient not found.")
 
-        if (
-            sender["balance"] is None
-            or sender["balance"] < amount
-        ):
+        if sender["balance"] is None or sender["balance"] < amount:
             conn.rollback()
             return alert_redirect("Insufficient account balance.")
 
         if not verify_pin(input_pin, sender["atm_pin"]):
             conn.rollback()
-            return alert_redirect("Incorrect ATM PIN.")
+            return alert_redirect("Incorrect ATM PIN. Transfer rejected.")
 
-        # Parse GPS coordinates. Fall back to registered coordinates
-        # if the browser did not supply valid values.
+        # GPS coordinates fall back to the registered home city.
         try:
             current_lat = (
                 float(live_lat)
@@ -970,7 +948,6 @@ async def process_transaction(
                 current_lon,
             )
 
-        # Match this payload to the features expected by your trained model.
         class PayloadContainer:
             def model_dump(self):
                 return {
@@ -984,7 +961,7 @@ async def process_transaction(
                     "online_order": 0,
                 }
 
-        # Fail closed if inference fails or returns invalid data.
+        # A failed or malformed prediction must never approve a transfer.
         try:
             results = fraud_service.predict(PayloadContainer())
 
@@ -1004,10 +981,9 @@ async def process_transaction(
             logger.exception("Unique Bank fraud inference failed.")
 
             return alert_redirect(
-                "Security verification failed. No money was transferred."
+                "Fraud verification failed. No money was transferred."
             )
 
-        # Blocked transactions are recorded without moving any money.
         if prediction == 1:
             conn.execute(
                 """
@@ -1046,10 +1022,11 @@ async def process_transaction(
             conn.commit()
 
             return alert_redirect(
-                f"Security blocked this transfer. Risk level: {risk_level}."
+                f"SECURITY BLOCKED: ML flagged this transfer. "
+                f"Risk level: {risk_level}."
             )
 
-        # Debit and credit are committed together.
+        # Both balance updates and the ledger entry commit together.
         conn.execute(
             """
             UPDATE users
@@ -1105,7 +1082,7 @@ async def process_transaction(
         conn.commit()
 
         return alert_redirect(
-            "Unique Bank: Your transfer was completed successfully."
+            "Unique Bank: Payment completed successfully!"
         )
 
     except HTTPException:
@@ -1116,7 +1093,7 @@ async def process_transaction(
         logger.exception("Unique Bank transaction failed.")
 
         return alert_redirect(
-            "The transfer could not be completed. Please try again."
+            "Transaction failed. Please try again."
         )
 
     finally:
@@ -1145,14 +1122,11 @@ async def manager_dashboard_view(
         if not role_check or role_check["role"] != "manager":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Manager authentication required.",
+                detail="Manager access required.",
             )
 
         total_tx = conn.execute(
-            """
-            SELECT COUNT(*) AS total
-            FROM transactions
-            """
+            "SELECT COUNT(*) AS total FROM transactions"
         ).fetchone()["total"]
 
         fraud_tx = conn.execute(
@@ -1181,9 +1155,7 @@ async def manager_dashboard_view(
 
     for tx in ledger:
         badge_class = (
-            "danger"
-            if tx["fraud_prediction"] == 1
-            else "success"
+            "danger" if tx["fraud_prediction"] == 1 else "success"
         )
 
         rows += f"""
@@ -1235,7 +1207,6 @@ async def manager_dashboard_view(
                 <h2>{total_tx:,}</h2>
             </div>
         </div>
-
         <div class="col-md-6">
             <div class="card shadow-sm p-4">
                 <p class="text-secondary mb-1">
