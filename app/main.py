@@ -160,3 +160,75 @@ async def customer_banking_portal(user: str = Depends(get_session_user)):
                 <h4>📋 My Recent Transactions</h4><hr>
                 <table class="table table-striped table-hover">
                     <thead><tr><th>Date</th><th>Recipient</th><th>Amount</th><th>Status</th></tr></thead>
+                    repeat_retailer: int = Form(...), used_chip: int = Form(...), used_pin_number: int = Form(...),
+online_order: int = Form(...), user: str = Depends(get_session_user)
+):
+if not user:
+raise HTTPException(status_code=401, detail="Expired session.")
+conn = get_db_connection()
+sender_profile = conn.execute("SELECT balance FROM users WHERE username = ?", (user,)).fetchone()
+if not sender_profile or sender_profile["balance"] < amount:
+conn.close()
+return HTMLResponse("alert('Failed: Insufficient Bank Account Funds.'); window.location.href='/portal';")
+class PayloadContainer:
+def model_dump(self):
+return {
+"distance_from_home": distance_from_home, "distance_from_last_transaction": distance_from_last_transaction,
+"ratio_to_median_purchase_price": ratio_to_median_purchase_price, "repeat_retailer": repeat_retailer,
+"used_chip": used_chip, "used_pin_number": used_pin_number, "online_order": online_order
+}
+results = fraud_service.predict(PayloadContainer())
+if results["fraud_prediction"] == 1:
+conn.execute("""
+INSERT INTO transactions (username, recipient, amount, distance_from_home, distance_from_last_transaction, ratio_to_median_purchase_price, repeat_retailer, used_chip, used_pin_number, online_order, fraud_prediction, fraud_probability, risk_level, decision)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+""", (user, recipient, amount, distance_from_home, distance_from_last_transaction, ratio_to_median_purchase_price, repeat_retailer, used_chip, used_pin_number, online_order, 1, results["fraud_probability"], results["risk_level"], "Blocked"))
+conn.commit()
+conn.close()
+return HTMLResponse(f"alert('🔴 SECURITY ALERT: Transaction blocked by AI Core! Risk Index Score: {results['risk_level']}. Action flagged as high-risk anomaly.'); window.location.href='/portal';")
+new_balance = sender_profile["balance"] - amount
+conn.execute("UPDATE users SET balance = ? WHERE username = ?", (new_balance, user))
+conn.execute("UPDATE users SET balance = balance + ? WHERE username = ?", (amount, recipient))
+conn.execute("""
+INSERT INTO transactions (username, recipient, amount, distance_from_home, distance_from_last_transaction, ratio_to_median_purchase_price, repeat_retailer,
+used_chip, used_pin_number, online_order, fraud_prediction, fraud_probability, risk_level, decision)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+""", (user, recipient, amount, distance_from_home, distance_from_last_transaction, ratio_to_median_purchase_price, repeat_retailer, used_chip, used_pin_number, online_order, 0, results["fraud_probability"], results["risk_level"], "Completed"))
+conn.commit()
+conn.close()
+return HTMLResponse("alert('🟢 Wire Transfer Verification Success! Funds successfully routed and settled.'); window.location.href='/portal';")
+
+--- MANAGER MONITORING DASHBOARD ---
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def manager_dashboard_view(user: str = Depends(get_session_user)):
+if not user:
+return RedirectResponse(url="/ui/login")
+conn = get_db_connection()
+role_check = conn.execute("SELECT role FROM users WHERE username = ?", (user,)).fetchone()
+if not role_check or role_check["role"] != "manager":
+conn.close()
+return HTMLResponse("❌ Unauthorized access. Dashboard limited to administrative manager profiles.")
+total_tx = conn.execute("SELECT COUNT() as total FROM transactions").fetchone()["total"]
+fraud_tx = conn.execute("SELECT COUNT() as fraud FROM transactions WHERE
+fraud_prediction = 1").fetchone()["fraud"]
+ledger = conn.execute("SELECT * FROM transactions ORDER BY timestamp DESC LIMIT 10").fetchall()
+conn.close()
+rows_html = "".join([f"{tx['timestamp']}{tx['username']} ➔ {tx['recipient']}${tx['amount']:.2f}{tx['distance_from_home']} km<span class='badge bg-{'danger' if tx['fraud_prediction']==1 else 'success'}'>{tx['decision']}{tx['risk_level']} ({tx['fraud_probability']:.2f})" for tx in ledger])
+return f"""
+System Administration Panel
+
+
+🛡️ AI System Threat Control CenterDisconnect Session
+Total Inspected Network Runs{total_tx}
+Intercepted High-Risk Attacks{fraud_tx}
+
+📋 Central Processing Risk Ledger
+<thead class="table-dark"><tr><th>Timestamp
+Direction Profile Vector
+Value
+Home Offset
+Automated Decision
+Threat Probability Score
+{rows_html if rows_html else 'No transaction traffic registered. Log into a Customer Account and execute payments!
+'}
