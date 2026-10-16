@@ -1,3 +1,35 @@
+import html
+import hashlib
+import hmac
+import logging
+import math
+import os
+import secrets
+import sqlite3
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
+from fastapi import FastAPI, Form, Request, HTTPException, status, Depends, Cookie
+from fastapi.responses import HTMLResponse, RedirectResponse
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+
+from app.database import init_db, get_db_connection
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("unique_bank")
+
+# Configure a stable secret in your environment for deployments.
+SECRET_KEY = os.getenv("BANK_SECRET_KEY", "dev-only-change-this-bank-secret-key")
+SESSION_COOKIE = "unique_bank_auth_session"
+SESSION_MAX_AGE = 3600
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+serializer = URLSafeTimedSerializer(SECRET_KEY, salt="unique-bank-session-salt")
+
+COUNTY_COORDINATES = {
+    "Mombasa": (-4.0435, 39.6682), "Kwale": (-4.1737, 39.4521),
+    "Kilifi": (-3.5107, 39.9093), "Tana River": (-1.5236, 39.1056),
+    "Lamu": (-2.2717, 40.9020), "Taita-Taveta": (-3.3161, 38.4850),
+    "Garissa": (-0.4532, 39.6461), "Wajir": (1.7471, 40.0573),
     "Mandera": (3.9373, 41.8569), "Marsabit": (2.3284, 37.9899),
     "Isiolo": (0.3546, 37.5822), "Meru": (0.0463, 37.6559),
     "Tharaka-Nithi": (-0.2965, 37.7238), "Embu": (-0.5388, 37.4574),
@@ -62,99 +94,3 @@ async def lifespan(app: FastAPI):
             if not existing:
                 conn.execute(
                     """INSERT INTO users
-                    (username, email, phone, hashed_password, role, verification_status)
-                    VALUES (?, ?, ?, ?, 'manager', 'Verified')""",
-                    (
-                        admin_username,
-                        os.getenv("ADMIN_EMAIL", "admin@uniquebank.local"),
-                        os.getenv("ADMIN_PHONE", ""),
-                        hash_secret_string(admin_password),
-                    ),
-                )
-                conn.commit()
-                logger.info("Manager account provisioned from environment configuration.")
-        finally:
-            conn.close()
-    yield
-
-
-app = FastAPI(title="Unique Bank Core System Engine", lifespan=lifespan)
-
-
-def hash_secret_string(value: str) -> str:
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", value.encode("utf-8"), salt, 310_000)
-    return f"pbkdf2_sha256${salt.hex()}${digest.hex()}"
-
-
-def verify_secret_string(value: str, stored_hash: str) -> bool:
-    try:
-        algorithm, salt_hex, digest_hex = stored_hash.split("$", 2)
-        if algorithm != "pbkdf2_sha256":
-            return False
-        expected = bytes.fromhex(digest_hex)
-        actual = hashlib.pbkdf2_hmac(
-            "sha256", value.encode("utf-8"), bytes.fromhex(salt_hex), 310_000
-        )
-        return hmac.compare_digest(actual, expected)
-    except (ValueError, TypeError, AttributeError):
-        return False
-
-
-def calculate_gps_distance(lat1, lon1, lat2, lon2) -> float:
-    if None in (lat1, lon1, lat2, lon2):
-        return 0.0
-    radius_km = 6371.0
-    d_lat = math.radians(float(lat2) - float(lat1))
-    d_lon = math.radians(float(lon2) - float(lon1))
-    a = (
-        math.sin(d_lat / 2) ** 2
-        + math.cos(math.radians(float(lat1)))
-        * math.cos(math.radians(float(lat2)))
-        * math.sin(d_lon / 2) ** 2
-    )
-    a = min(1.0, max(0.0, a))
-    return round(radius_km * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)), 2)
-
-
-def get_session_user(session_token: str = Cookie(default=None)):
-    if not session_token:
-        return None
-    try:
-        data = serializer.loads(session_token, max_age=SESSION_MAX_AGE)
-        conn = get_db_connection()
-        try:
-            return conn.execute(
-                "SELECT * FROM users WHERE id = ?", (data["user_id"],)
-            ).fetchone()
-        finally:
-            conn.close()
-    except (BadSignature, SignatureExpired, KeyError, TypeError, ValueError):
-        return None
-
-
-def get_request_user(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
-    if not token:
-        return None
-    try:
-        data = serializer.loads(token, max_age=SESSION_MAX_AGE)
-        conn = get_db_connection()
-        try:
-            return conn.execute(
-                "SELECT * FROM users WHERE id = ?", (data["user_id"],)
-            ).fetchone()
-        finally:
-            conn.close()
-    except Exception:
-        return None
-
-
-@app.get("/", response_class=HTMLResponse)
-async def home_portal(user=Depends(get_session_user)):
-    if user:
-        target = "/dashboard" if user["role"] == "manager" else "/portal"
-        return RedirectResponse(target, status_code=status.HTTP_303_SEE_OTHER)
-    body = """
-<div class="card shadow-lg p-5 text-center">
-<div style="font-size:4rem">🛡️</div><h1 class="display-4 fw-bold">Unique Bank</h1>
