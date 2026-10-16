@@ -14,7 +14,7 @@ def init_db():
     
     cursor.execute("PRAGMA journal_mode = WAL")
     
-    # 1. Users Authentication Profiles & Verification Stages
+    # 1. Base Authentication & Registration Pipeline Stages Table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,7 +30,7 @@ def init_db():
     )
     """)
     
-    # 2. Provisioned Bank Accounts Table (With auto account numbers and sub-vaults)
+    # 2. Provisioned Unique Bank Accounts & Sub-Ledger Pools Table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS bank_accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,7 +50,7 @@ def init_db():
     )
     """)
     
-    # 3. Location Velocity Transactions Registry
+    # 3. Autonomous Velocity GPS Risk Check Transactions Ledger
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,7 +70,7 @@ def init_db():
     
     conn.commit()
     conn.close()
-    print("💾 Unique Bank tables successfully deployed.")
+    print("💾 Unique Bank schema initialization verified.")
 
 if __name__ == "__main__":
     init_db()
