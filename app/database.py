@@ -12,10 +12,9 @@ def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Enable WAL mode for high concurrency write handling
     cursor.execute("PRAGMA journal_mode = WAL")
     
-    # 1. Base Users Auth Profiles Table (Step 1 Registration)
+    # 1. Users Authentication Profiles & Verification Stages
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,7 +30,7 @@ def init_db():
     )
     """)
     
-    # 2. Provisoned Bank Accounts Table (Step 2 Registration)
+    # 2. Provisioned Bank Accounts Table (With auto account numbers and sub-vaults)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS bank_accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,7 +50,7 @@ def init_db():
     )
     """)
     
-    # 3. Enhanced Real-Time Location Transactions Ledger Table
+    # 3. Location Velocity Transactions Registry
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,7 +70,7 @@ def init_db():
     
     conn.commit()
     conn.close()
-    print("💾 Unique Bank persistent production database tables initialized successfully.")
+    print("💾 Unique Bank tables successfully deployed.")
 
 if __name__ == "__main__":
     init_db()
