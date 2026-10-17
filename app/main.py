@@ -5,7 +5,6 @@ import logging
 import math
 import os
 import secrets
-import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,79 +13,8 @@ from fastapi import FastAPI, Form, Request, HTTPException, status, Depends, Cook
 from fastapi.responses import HTMLResponse, RedirectResponse
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
-# Use an absolute path based on this file's location to avoid creating multiple DB files
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = os.getenv("BANK_DB_PATH", str(BASE_DIR / "unique_bank.db"))
-
-
-def get_db_connection():
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 15000")
-    return conn
-
-
-def init_db():
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    conn = get_db_connection()
-    try:
-        conn.executescript(
-            '''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                email TEXT NOT NULL UNIQUE,
-                phone TEXT NOT NULL UNIQUE,
-                hashed_password TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'customer',
-                verification_status TEXT NOT NULL DEFAULT 'Pending OTP',
-                verification_code TEXT,
-                id_image_path TEXT,
-                last_active DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS bank_accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL UNIQUE,
-                account_number TEXT NOT NULL UNIQUE,
-                id_number TEXT NOT NULL UNIQUE,
-                phone_number TEXT NOT NULL,
-                county TEXT NOT NULL,
-                home_lat REAL NOT NULL,
-                home_lon REAL NOT NULL,
-                pin_hash TEXT NOT NULL,
-                balance REAL NOT NULL DEFAULT 0 CHECK (balance >= 0),
-                savings_balance REAL NOT NULL DEFAULT 0 CHECK (savings_balance >= 0),
-                loan_balance REAL NOT NULL DEFAULT 0 CHECK (loan_balance >= 0),
-                savings_active INTEGER NOT NULL DEFAULT 0 CHECK (savings_active IN (0, 1)),
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                sender_account TEXT NOT NULL,
-                recipient_account TEXT NOT NULL,
-                amount REAL NOT NULL CHECK (amount > 0),
-                distance_from_home REAL NOT NULL DEFAULT 0,
-                used_pin_number INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL,
-                reason TEXT,
-                risk_score INTEGER NOT NULL DEFAULT 0,
-                tx_lat REAL,
-                tx_lon REAL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_transactions_sender
-                ON transactions(sender_account);
-            CREATE INDEX IF NOT EXISTS idx_transactions_recipient
-                ON transactions(recipient_account);
-            '''
-        )
-        conn.commit()
-    finally:
-        conn.close()
+# Import database connection from database.py
+from database import get_db_connection
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("unique_bank")
@@ -153,6 +81,7 @@ def alert_redirect(message: str, destination: str = "/portal") -> HTMLResponse:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from database import init_db
     init_db()
     admin_username = os.getenv("ADMIN_USERNAME")
     admin_password = os.getenv("ADMIN_PASSWORD")
@@ -319,7 +248,7 @@ async def process_register(
             (username.strip(), email.strip().lower(), phone.strip(), hash_secret_string(password), otp_code),
         )
         conn.commit()
-    except sqlite3.IntegrityError:
+    except Exception:
         return alert_redirect("Username, email or phone is already registered.", "/ui/register")
     finally:
         conn.close()
@@ -555,7 +484,7 @@ async def process_account_provisioning(
             (user["id"],),
         )
         conn.commit()
-    except sqlite3.IntegrityError:
+    except Exception:
         return alert_redirect("Account could not be created because a unique value already exists.")
     finally:
         conn.close()
@@ -764,13 +693,11 @@ async def manager_dashboard_view(request: Request, search_acc: str = None):
     try:
         total_tx = conn.execute("SELECT COUNT(*) AS total FROM transactions").fetchone()["total"]
         
-        # Blocked transactions list for popup detail modal
         blocked_tx_list = conn.execute(
             "SELECT * FROM transactions WHERE status = 'Blocked' ORDER BY id DESC"
         ).fetchall()
         blocked_tx_count = len(blocked_tx_list)
 
-        # Members Query with Account filtering
         if search_acc and search_acc.strip():
             acc_clean = f"%{search_acc.strip()}%"
             members_query = """
@@ -804,7 +731,6 @@ async def manager_dashboard_view(request: Request, search_acc: str = None):
     finally:
         conn.close()
 
-    # Build Members rows
     member_rows = ""
     now = datetime.now(timezone.utc)
     for m in members:
@@ -830,7 +756,6 @@ async def manager_dashboard_view(request: Request, search_acc: str = None):
             f"<td><span class='badge text-bg-secondary'>{days_inactive} day(s) ago</span></td></tr>"
         )
 
-    # Build Risk Ledger rows
     rows = ""
     for tx in ledger:
         risk_score = tx["risk_score"] if "risk_score" in tx.keys() else 0
@@ -845,7 +770,6 @@ async def manager_dashboard_view(request: Request, search_acc: str = None):
             "</td><td>" + html.escape(str(tx["reason"] or "")) + "</td></tr>"
         )
 
-    # Build Blocked Details Modal Content
     blocked_modal_rows = ""
     for b_tx in blocked_tx_list:
         blocked_modal_rows += (
