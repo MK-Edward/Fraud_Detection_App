@@ -27,7 +27,8 @@ def init_db():
                 role TEXT NOT NULL DEFAULT 'customer',
                 verification_status TEXT NOT NULL DEFAULT 'Pending OTP',
                 verification_code TEXT,
-                id_image_path TEXT
+                id_image_path TEXT,
+                last_active DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS bank_accounts (
@@ -57,6 +58,7 @@ def init_db():
                 used_pin_number INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
                 reason TEXT,
+                risk_score INTEGER NOT NULL DEFAULT 0,
                 tx_lat REAL,
                 tx_lon REAL
             );
