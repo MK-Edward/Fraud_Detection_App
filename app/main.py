@@ -13,8 +13,8 @@ from fastapi import FastAPI, Form, Request, HTTPException, status, Depends, Cook
 from fastapi.responses import HTMLResponse, RedirectResponse
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
-# Import database connection from database.py
-from database import get_db_connection
+# Import database connection using relative import from app.database
+from .database import get_db_connection
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("unique_bank")
@@ -81,7 +81,7 @@ def alert_redirect(message: str, destination: str = "/portal") -> HTMLResponse:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from database import init_db
+    from .database import init_db
     init_db()
     admin_username = os.getenv("ADMIN_USERNAME")
     admin_password = os.getenv("ADMIN_PASSWORD")
