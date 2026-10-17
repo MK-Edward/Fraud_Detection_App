@@ -14,8 +14,9 @@ from fastapi import FastAPI, Form, Request, HTTPException, status, Depends, Cook
 from fastapi.responses import HTMLResponse, RedirectResponse
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
-# Self-contained SQLite database setup (no external app.database module required).
-DB_PATH = os.getenv("BANK_DB_PATH", str(Path(__file__).with_name("unique_bank.db")))
+# Use an absolute path based on this file's location to avoid creating multiple DB files
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = os.getenv("BANK_DB_PATH", str(BASE_DIR / "unique_bank.db"))
 
 
 def get_db_connection():
@@ -142,7 +143,6 @@ def page(title: str, body: str) -> str:
 
 
 def alert_redirect(message: str, destination: str = "/portal") -> HTMLResponse:
-    # JSON string encoding safely escapes quotes and newlines for JavaScript.
     import json
     return HTMLResponse(
         f"<script>alert({json.dumps(message)});window.location.href={json.dumps(destination)};</script>"
@@ -152,7 +152,6 @@ def alert_redirect(message: str, destination: str = "/portal") -> HTMLResponse:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    # Optional manager provisioning. Set ADMIN_USERNAME and ADMIN_PASSWORD explicitly.
     admin_username = os.getenv("ADMIN_USERNAME")
     admin_password = os.getenv("ADMIN_PASSWORD")
     if admin_username and admin_password:
@@ -310,7 +309,6 @@ async def process_register(
         return alert_redirect("Username, email or phone is already registered.", "/ui/register")
     finally:
         conn.close()
-    # Demo OTP is shown in the browser alert; no real email/SMS is sent.
     return alert_redirect(f"Demo verification code ({channel}): {otp_code}", f"/ui/verify?user={username}")
 
 
@@ -462,17 +460,17 @@ async def customer_banking_portal(request: Request):
 <thead><tr><th>Timestamp</th><th>Other account</th><th>Amount</th><th>Status</th></tr></thead>
 <tbody>{tx_rows or '<tr><td colspan="4">No transactions yet.</td></tr>'}</tbody></table></div></div>
 <script>
-function captureLocation(event) {{
+function captureLocation(event) {
  event.preventDefault();
  const form = document.getElementById('payment_form');
- if (navigator.geolocation) {{
-   navigator.geolocation.getCurrentPosition((pos) => {{
+ if (navigator.geolocation) {
+   navigator.geolocation.getCurrentPosition((pos) => {
      document.getElementById('live_lat').value = pos.coords.latitude;
      document.getElementById('live_lon').value = pos.coords.longitude;
      form.submit();
-   }}, () => form.submit(), {{timeout:5000}});
- }} else {{ form.submit(); }}
-}}
+   }, () => form.submit(), {timeout:5000});
+ } else { form.submit(); }
+}
 </script>"""
     return page("Account portal", body)
 
@@ -586,7 +584,6 @@ async def process_loan_request(
         raise HTTPException(status_code=401)
     if not math.isfinite(loan_amount) or loan_amount <= 0:
         return alert_redirect("Enter a valid positive loan amount.")
-    # Demonstration only: this is not a real credit assessment or loan approval.
     conn = get_db_connection()
     try:
         account = conn.execute(
@@ -660,7 +657,6 @@ async def process_transaction(
             conn.commit()
             return alert_redirect(f"Transfer blocked by demo risk checks: {reason}.")
 
-        # Check and update both accounts in one transaction.
         if float(sender["balance"]) < amount:
             return alert_redirect("Insufficient checking balance.")
         conn.execute("UPDATE bank_accounts SET balance = balance - ? WHERE id = ?", (amount, sender["id"]))
