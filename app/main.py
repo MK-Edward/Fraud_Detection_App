@@ -460,17 +460,17 @@ async def customer_banking_portal(request: Request):
 <thead><tr><th>Timestamp</th><th>Other account</th><th>Amount</th><th>Status</th></tr></thead>
 <tbody>{tx_rows or '<tr><td colspan="4">No transactions yet.</td></tr>'}</tbody></table></div></div>
 <script>
-function captureLocation(event) {
+function captureLocation(event) {{
  event.preventDefault();
  const form = document.getElementById('payment_form');
- if (navigator.geolocation) {
-   navigator.geolocation.getCurrentPosition((pos) => {
+ if (navigator.geolocation) {{
+   navigator.geolocation.getCurrentPosition((pos) => {{
      document.getElementById('live_lat').value = pos.coords.latitude;
      document.getElementById('live_lon').value = pos.coords.longitude;
      form.submit();
-   }, () => form.submit(), {timeout:5000});
- } else { form.submit(); }
-}
+   }}, () => form.submit(), {{timeout:5000}});
+ }} else {{ form.submit(); }}
+}}
 </script>"""
     return page("Account portal", body)
 
