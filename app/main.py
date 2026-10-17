@@ -42,7 +42,8 @@ def init_db():
                 role TEXT NOT NULL DEFAULT 'customer',
                 verification_status TEXT NOT NULL DEFAULT 'Pending OTP',
                 verification_code TEXT,
-                id_image_path TEXT
+                id_image_path TEXT,
+                last_active DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS bank_accounts (
@@ -72,6 +73,7 @@ def init_db():
                 used_pin_number INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
                 reason TEXT,
+                risk_score INTEGER NOT NULL DEFAULT 0,
                 tx_lat REAL,
                 tx_lon REAL
             );
@@ -89,7 +91,6 @@ def init_db():
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("unique_bank")
 
-# Configure a stable secret in your environment for deployments.
 SECRET_KEY = os.getenv("BANK_SECRET_KEY", "dev-only-change-this-bank-secret-key")
 SESSION_COOKIE = "unique_bank_auth_session"
 SESSION_MAX_AGE = 3600
@@ -131,8 +132,9 @@ def page(title: str, body: str) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{safe_title} — Unique Bank</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <style>body{{background:#f3f6fb;color:#172b4d}}.navbar{{background:#102a43}}
-.card{{border:0;border-radius:16px}}.brand{{font-weight:800}}main{{max-width:1000px}}
+.card{{border:0;border-radius:16px}}.brand{{font-weight:800}}main{{max-width:1100px}}
 </style></head><body>
 <nav class="navbar navbar-dark mb-4 py-3"><div class="container">
 <a class="navbar-brand brand" href="/">🛡️ Unique Bank</a>
@@ -225,9 +227,15 @@ def get_session_user(session_token: str = Cookie(default=None, alias=SESSION_COO
         data = serializer.loads(session_token, max_age=SESSION_MAX_AGE)
         conn = get_db_connection()
         try:
-            return conn.execute(
+            user = conn.execute(
                 "SELECT * FROM users WHERE id = ?", (data["user_id"],)
             ).fetchone()
+            if user:
+                conn.execute(
+                    "UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE id = ?", (user["id"],)
+                )
+                conn.commit()
+            return user
         finally:
             conn.close()
     except (BadSignature, SignatureExpired, KeyError, TypeError, ValueError):
@@ -242,9 +250,15 @@ def get_request_user(request: Request):
         data = serializer.loads(token, max_age=SESSION_MAX_AGE)
         conn = get_db_connection()
         try:
-            return conn.execute(
+            user = conn.execute(
                 "SELECT * FROM users WHERE id = ?", (data["user_id"],)
             ).fetchone()
+            if user:
+                conn.execute(
+                    "UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE id = ?", (user["id"],)
+                )
+                conn.commit()
+            return user
         finally:
             conn.close()
     except Exception:
@@ -449,13 +463,38 @@ async def customer_banking_portal(request: Request):
 <div class="mb-3"><label class="form-label">Four-digit ATM PIN</label><input class="form-control" type="password" name="input_pin" pattern="[0-9]{{4}}" maxlength="4" required></div>
 <input type="hidden" id="live_lat" name="live_lat"><input type="hidden" id="live_lon" name="live_lon">
 <button class="btn btn-primary">Scan GPS and authorize transfer</button></form></div>
+
 <div class="card shadow-sm p-4 mb-4"><h4>💰 Savings and loans</h4>
 <p>Savings: <b>{'Active' if active else 'Inactive'}</b> · Loan balance: <b>${float(account['loan_balance']):.2f}</b></p>
-<div class="d-flex flex-wrap gap-2">
-<form action="/portal/savings-toggle" method="post"><button class="btn btn-outline-primary">{'Deactivate' if active else 'Activate'} savings</button></form>
-<form action="/portal/savings-deposit" method="post" class="d-flex gap-2"><input class="form-control" type="number" name="save_amount" min="0.01" step="0.01" placeholder="Save amount" required><button class="btn btn-success">Save</button></form>
-<form action="/portal/loan-request" method="post" class="d-flex gap-2"><input class="form-control" type="number" name="loan_amount" min="0.01" step="0.01" placeholder="Loan amount" required><button class="btn btn-warning">Request demo loan</button></form>
+<div class="d-flex flex-wrap gap-2 mb-3">
+<form action="/portal/savings-toggle" method="post" onsubmit="return confirmSavingsActivation(event, {1 if active else 0})">
+    <button class="btn btn-outline-primary">{'Deactivate' if active else 'Activate'} savings</button>
+</form>
+</div>
+<div class="row g-3">
+<div class="col-md-4">
+    <form action="/portal/savings-deposit" method="post" class="d-flex flex-column gap-2">
+        <label class="form-label small fw-bold">Deposit to Savings</label>
+        <input class="form-control" type="number" name="save_amount" min="0.01" step="0.01" placeholder="Amount ($)" required>
+        <button class="btn btn-success btn-sm">Save funds</button>
+    </form>
+</div>
+<div class="col-md-4">
+    <form action="/portal/savings-withdraw" method="post" class="d-flex flex-column gap-2">
+        <label class="form-label small fw-bold">Withdraw from Savings</label>
+        <input class="form-control" type="number" name="withdraw_amount" min="0.01" step="0.01" placeholder="Amount ($)" required>
+        <button class="btn btn-info btn-sm text-white">Withdraw funds</button>
+    </form>
+</div>
+<div class="col-md-4">
+    <form action="/portal/loan-request" method="post" class="d-flex flex-column gap-2">
+        <label class="form-label small fw-bold">Request Demo Loan</label>
+        <input class="form-control" type="number" name="loan_amount" min="0.01" step="0.01" placeholder="Amount ($)" required>
+        <button class="btn btn-warning btn-sm">Request loan</button>
+    </form>
+</div>
 </div></div>
+
 <div class="card shadow-sm p-4"><h4>📋 Recent transfers</h4><div class="table-responsive"><table class="table">
 <thead><tr><th>Timestamp</th><th>Other account</th><th>Amount</th><th>Status</th></tr></thead>
 <tbody>{tx_rows or '<tr><td colspan="4">No transactions yet.</td></tr>'}</tbody></table></div></div>
@@ -470,6 +509,13 @@ function captureLocation(event) {{
      form.submit();
    }}, () => form.submit(), {{timeout:5000}});
  }} else {{ form.submit(); }}
+}}
+
+function confirmSavingsActivation(event, isCurrentlyActive) {{
+ if (!isCurrentlyActive) {{
+     return confirm("Are you sure you really want to activate savings?");
+ }}
+ return true;
 }}
 </script>"""
     return page("Account portal", body)
@@ -576,6 +622,32 @@ async def process_savings_deposit(
     return RedirectResponse("/portal", status_code=status.HTTP_303_SEE_OTHER)
 
 
+@app.post("/portal/savings-withdraw")
+async def process_savings_withdraw(
+    withdraw_amount: float = Form(...), user=Depends(get_session_user)
+):
+    if not user:
+        raise HTTPException(status_code=401)
+    if not math.isfinite(withdraw_amount) or withdraw_amount <= 0:
+        return alert_redirect("Enter a valid positive withdrawal amount.")
+    conn = get_db_connection()
+    try:
+        acc = conn.execute(
+            "SELECT * FROM bank_accounts WHERE user_id = ?", (user["id"],)
+        ).fetchone()
+        if not acc or acc["savings_balance"] < withdraw_amount:
+            return alert_redirect("Insufficient savings balance for withdrawal.")
+        conn.execute(
+            """UPDATE bank_accounts SET balance = balance + ?,
+            savings_balance = savings_balance - ? WHERE user_id = ?""",
+            (withdraw_amount, withdraw_amount, user["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return RedirectResponse("/portal", status_code=status.HTTP_303_SEE_OTHER)
+
+
 @app.post("/portal/loan-request")
 async def process_loan_request(
     loan_amount: float = Form(...), user=Depends(get_session_user)
@@ -640,19 +712,23 @@ async def process_transaction(
         pin_matched = verify_secret_string(input_pin, sender["pin_hash"])
         reason = "Approved"
         tx_status = "Completed"
+        risk_score = 0
+
         if not pin_matched:
             tx_status, reason = "Blocked", "PIN verification failed"
+            risk_score = 100
         elif distance_home > 1500.0:
             tx_status, reason = "Blocked", "Location is more than 1500 km from home county"
+            risk_score = 85
 
         if tx_status == "Blocked":
             conn.execute(
                 """INSERT INTO transactions
                 (sender_account, recipient_account, amount, distance_from_home, used_pin_number,
-                 status, reason, tx_lat, tx_lon)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 status, reason, risk_score, tx_lat, tx_lon)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (sender["account_number"], recipient_account, amount, distance_home,
-                 int(pin_matched), tx_status, reason, current_lat, current_lon),
+                 int(pin_matched), tx_status, reason, risk_score, current_lat, current_lon),
             )
             conn.commit()
             return alert_redirect(f"Transfer blocked by demo risk checks: {reason}.")
@@ -664,8 +740,8 @@ async def process_transaction(
         conn.execute(
             """INSERT INTO transactions
             (sender_account, recipient_account, amount, distance_from_home, used_pin_number,
-             status, reason, tx_lat, tx_lon)
-            VALUES (?, ?, ?, ?, 1, 'Completed', 'Approved', ?, ?)""",
+             status, reason, risk_score, tx_lat, tx_lon)
+            VALUES (?, ?, ?, ?, 1, 'Completed', 'Approved', 0, ?, ?)""",
             (sender["account_number"], receiver["account_number"], amount,
              distance_home, current_lat, current_lon),
         )
@@ -680,39 +756,189 @@ async def process_transaction(
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def manager_dashboard_view(request: Request):
+async def manager_dashboard_view(request: Request, search_acc: str = None):
     user = get_request_user(request)
     if not user or user["role"] != "manager":
         return HTMLResponse(page("Access denied", '<div class="alert alert-danger">Manager access required.</div>'), status_code=403)
     conn = get_db_connection()
     try:
         total_tx = conn.execute("SELECT COUNT(*) AS total FROM transactions").fetchone()["total"]
-        blocked_tx = conn.execute(
-            "SELECT COUNT(*) AS total FROM transactions WHERE status = 'Blocked'"
-        ).fetchone()["total"]
-        ledger = conn.execute("SELECT * FROM transactions ORDER BY id DESC LIMIT 20").fetchall()
+        
+        # Blocked transactions list for popup detail modal
+        blocked_tx_list = conn.execute(
+            "SELECT * FROM transactions WHERE status = 'Blocked' ORDER BY id DESC"
+        ).fetchall()
+        blocked_tx_count = len(blocked_tx_list)
+
+        # Members Query with Account filtering
+        if search_acc and search_acc.strip():
+            acc_clean = f"%{search_acc.strip()}%"
+            members_query = """
+                SELECT u.username, u.email, u.phone, u.last_active, b.account_number
+                FROM users u
+                LEFT JOIN bank_accounts b ON u.id = b.user_id
+                WHERE u.role = 'customer' AND (b.account_number LIKE ? OR u.username LIKE ?)
+                ORDER BY u.id DESC
+            """
+            members = conn.execute(members_query, (acc_clean, acc_clean)).fetchall()
+            
+            tx_query = """
+                SELECT * FROM transactions 
+                WHERE sender_account LIKE ? OR recipient_account LIKE ?
+                ORDER BY id DESC LIMIT 50
+            """
+            ledger = conn.execute(tx_query, (acc_clean, acc_clean)).fetchall()
+        else:
+            members_query = """
+                SELECT u.username, u.email, u.phone, u.last_active, b.account_number
+                FROM users u
+                LEFT JOIN bank_accounts b ON u.id = b.user_id
+                WHERE u.role = 'customer'
+                ORDER BY u.id DESC
+            """
+            members = conn.execute(members_query).fetchall()
+            ledger = conn.execute("SELECT * FROM transactions ORDER BY id DESC LIMIT 50").fetchall()
+
+        total_members = conn.execute("SELECT COUNT(*) AS total FROM users WHERE role = 'customer'").fetchone()["total"]
+        
     finally:
         conn.close()
+
+    # Build Members rows
+    member_rows = ""
+    now = datetime.now(timezone.utc)
+    for m in members:
+        last_act_str = str(m["last_active"]) if m["last_active"] else None
+        if last_act_str:
+            try:
+                dt_active = datetime.fromisoformat(last_act_str.replace("Z", "+00:00"))
+                if dt_active.tzinfo is None:
+                    dt_active = dt_active.replace(tzinfo=timezone.utc)
+                days_inactive = (now - dt_active).days
+            except Exception:
+                days_inactive = 0
+        else:
+            days_inactive = 0
+        
+        acc_display = html.escape(m["account_number"]) if m["account_number"] else "<i>No Account</i>"
+        
+        member_rows += (
+            f"<tr><td><b>{html.escape(m['username'])}</b></td>"
+            f"<td>{acc_display}</td>"
+            f"<td>{html.escape(m['email'])}</td>"
+            f"<td>{html.escape(m['phone'] or 'N/A')}</td>"
+            f"<td><span class='badge text-bg-secondary'>{days_inactive} day(s) ago</span></td></tr>"
+        )
+
+    # Build Risk Ledger rows
     rows = ""
     for tx in ledger:
+        risk_score = tx["risk_score"] if "risk_score" in tx.keys() else 0
+        risk_badge = f"<span class='badge text-bg-danger'>{risk_score}</span>" if risk_score > 50 else f"<span class='badge text-bg-success'>{risk_score}</span>"
+        
         rows += (
             "<tr><td>" + html.escape(str(tx["timestamp"])[:19]) + "</td><td>" +
             html.escape(str(tx["sender_account"])) + " → " +
             html.escape(str(tx["recipient_account"])) + "</td><td>$" +
-            f"{float(tx['amount']):.2f}</td><td>" + html.escape(str(tx["status"])) +
+            f"{float(tx['amount']):.2f}</td><td>" + risk_badge + "</td><td>" +
+            html.escape(str(tx["status"])) +
             "</td><td>" + html.escape(str(tx["reason"] or "")) + "</td></tr>"
         )
+
+    # Build Blocked Details Modal Content
+    blocked_modal_rows = ""
+    for b_tx in blocked_tx_list:
+        blocked_modal_rows += (
+            f"<tr><td>{html.escape(str(b_tx['timestamp'])[:19])}</td>"
+            f"<td>{html.escape(str(b_tx['sender_account']))} → {html.escape(str(b_tx['recipient_account']))}</td>"
+            f"<td>${float(b_tx['amount']):.2f}</td>"
+            f"<td><span class='badge text-bg-danger'>{html.escape(str(b_tx['reason'] or ''))}</span></td></tr>"
+        )
+
+    search_val = html.escape(search_acc) if search_acc else ""
+
     body = f"""
 <h2>🛡️ System control center</h2>
-<div class="row g-3 my-3"><div class="col-md-6"><div class="card shadow-sm p-3">
-<small>Total transactions</small><strong class="fs-3">{total_tx}</strong></div></div>
-<div class="col-md-6"><div class="card shadow-sm p-3"><small>Blocked transactions</small>
-<strong class="fs-3">{blocked_tx}</strong></div></div></div>
-<div class="card shadow-sm p-4"><h4>📋 Transaction risk ledger</h4>
-<div class="table-responsive"><table class="table table-striped">
-<thead><tr><th>Timestamp</th><th>Accounts</th><th>Amount</th><th>Status</th><th>Reason</th></tr></thead>
-<tbody>{rows or '<tr><td colspan="5">No transactions recorded.</td></tr>'}</tbody>
-</table></div></div>"""
+
+<div class="card shadow-sm p-3 my-3">
+    <form method="get" action="/dashboard" class="row g-2 align-items-center">
+        <div class="col-auto"><label class="col-form-label fw-bold">🔍 Filter Account Activity:</label></div>
+        <div class="col-auto">
+            <input type="text" name="search_acc" class="form-control" placeholder="Account No or Username" value="{search_val}">
+        </div>
+        <div class="col-auto">
+            <button type="submit" class="btn btn-primary">Filter</button>
+            <a href="/dashboard" class="btn btn-outline-secondary">Reset</a>
+        </div>
+    </form>
+</div>
+
+<div class="row g-3 my-3">
+    <div class="col-md-4">
+        <div class="card shadow-sm p-3">
+            <small>Total Members</small><strong class="fs-3">{total_members}</strong>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card shadow-sm p-3">
+            <small>Total Transactions</small><strong class="fs-3">{total_tx}</strong>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card shadow-sm p-3" style="cursor:pointer;" data-bs-toggle="modal" data-bs-target="#blockedTxModal">
+            <small>Blocked Transactions (Click to view)</small>
+            <strong class="fs-3 text-danger">{blocked_tx_count} 🔍</strong>
+        </div>
+    </div>
+</div>
+
+<div class="card shadow-sm p-4 mb-4">
+    <h4>👥 Registered Members ({len(members)})</h4>
+    <div class="table-responsive">
+        <table class="table table-hover">
+            <thead>
+                <tr><th>Username</th><th>Account Number</th><th>Email</th><th>Phone</th><th>Last Active</th></tr>
+            </thead>
+            <tbody>{member_rows or '<tr><td colspan="5">No members found.</td></tr>'}</tbody>
+        </table>
+    </div>
+</div>
+
+<div class="card shadow-sm p-4">
+    <h4>📋 Transaction Risk Ledger</h4>
+    <div class="table-responsive">
+        <table class="table table-striped">
+            <thead>
+                <tr><th>Timestamp</th><th>Accounts</th><th>Amount</th><th>Risk Score</th><th>Status</th><th>Reason</th></tr>
+            </thead>
+            <tbody>{rows or '<tr><td colspan="6">No transactions recorded.</td></tr>'}</tbody>
+        </table>
+    </div>
+</div>
+
+<!-- Modal for Blocked Transactions -->
+<div class="modal fade" id="blockedTxModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">🚫 Blocked Transactions Details</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="table-responsive">
+            <table class="table table-bordered">
+                <thead><tr><th>Time</th><th>Transfer</th><th>Amount</th><th>Reason</th></tr></thead>
+                <tbody>{blocked_modal_rows or '<tr><td colspan="4">No blocked transactions recorded.</td></tr>'}</tbody>
+            </table>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+"""
     return page("Manager dashboard", body)
 
 
