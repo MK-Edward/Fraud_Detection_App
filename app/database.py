@@ -5,14 +5,33 @@ from pathlib import Path
 # Check if Render's DATABASE_URL environment variable is set
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+class PostgresConnectionWrapper:
+    def __init__(self, conn):
+        self.conn = conn
+    def execute(self, sql, params=None):
+        cur = self.conn.cursor()
+        # Convert SQLite '?' placeholders to Postgres '%s' placeholders
+        postgres_sql = sql.replace('?', '%s')
+        if params:
+            cur.execute(postgres_sql, params)
+        else:
+            cur.execute(postgres_sql)
+        return cur
+    def commit(self):
+        self.conn.commit()
+    def rollback(self):
+        self.conn.rollback()
+    def close(self):
+        self.conn.close()
+
 if DATABASE_URL:
     import psycopg2
     import psycopg2.extras
 
     def get_db_connection():
-        # Connect to Render PostgreSQL
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
-        return conn
+        # Connect to Render PostgreSQL and wrap it so .execute() works seamlessly
+        raw_conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+        return PostgresConnectionWrapper(raw_conn)
 else:
     # Fallback to local SQLite
     BASE_DIR = Path(__file__).resolve().parent
@@ -30,54 +49,55 @@ def init_db():
     try:
         if DATABASE_URL:
             # PostgreSQL Schema Initialization
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    '''
-                    CREATE TABLE IF NOT EXISTS users (
-                        id SERIAL PRIMARY KEY,
-                        username TEXT NOT NULL UNIQUE,
-                        email TEXT NOT NULL UNIQUE,
-                        phone TEXT NOT NULL UNIQUE,
-                        hashed_password TEXT NOT NULL,
-                        role TEXT NOT NULL DEFAULT 'customer',
-                        verification_status TEXT NOT NULL DEFAULT 'Pending OTP',
-                        verification_code TEXT,
-                        id_image_path TEXT,
-                        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
+            cursor = conn.cursor() if hasattr(conn, 'cursor') else conn.conn.cursor()
+            cursor.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    email TEXT NOT NULL UNIQUE,
+                    phone TEXT NOT NULL UNIQUE,
+                    hashed_password TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'customer',
+                    verification_status TEXT NOT NULL DEFAULT 'Pending OTP',
+                    verification_code TEXT,
+                    id_image_path TEXT,
+                    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
 
-                    CREATE TABLE IF NOT EXISTS bank_accounts (
-                        id SERIAL PRIMARY KEY,
-                        user_id INT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
-                        account_number TEXT NOT NULL UNIQUE,
-                        id_number TEXT NOT NULL UNIQUE,
-                        phone_number TEXT NOT NULL,
-                        county TEXT NOT NULL,
-                        home_lat REAL NOT NULL,
-                        home_lon REAL NOT NULL,
-                        pin_hash TEXT NOT NULL,
-                        balance REAL NOT NULL DEFAULT 0 CHECK (balance >= 0),
-                        savings_balance REAL NOT NULL DEFAULT 0 CHECK (savings_balance >= 0),
-                        loan_balance REAL NOT NULL DEFAULT 0 CHECK (loan_balance >= 0),
-                        savings_active INT NOT NULL DEFAULT 0 CHECK (savings_active IN (0, 1))
-                    );
+                CREATE TABLE IF NOT EXISTS bank_accounts (
+                    id SERIAL PRIMARY KEY,
+                    user_id INT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+                    account_number TEXT NOT NULL UNIQUE,
+                    id_number TEXT NOT NULL UNIQUE,
+                    phone_number TEXT NOT NULL,
+                    county TEXT NOT NULL,
+                    home_lat REAL NOT NULL,
+                    home_lon REAL NOT NULL,
+                    pin_hash TEXT NOT NULL,
+                    balance REAL NOT NULL DEFAULT 0 CHECK (balance >= 0),
+                    savings_balance REAL NOT NULL DEFAULT 0 CHECK (savings_balance >= 0),
+                    loan_balance REAL NOT NULL DEFAULT 0 CHECK (loan_balance >= 0),
+                    savings_active INT NOT NULL DEFAULT 0 CHECK (savings_active IN (0, 1))
+                );
 
-                    CREATE TABLE IF NOT EXISTS transactions (
-                        id SERIAL PRIMARY KEY,
-                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        sender_account TEXT NOT NULL,
-                        recipient_account TEXT NOT NULL,
-                        amount REAL NOT NULL CHECK (amount > 0),
-                        distance_from_home REAL NOT NULL DEFAULT 0,
-                        used_pin_number INT NOT NULL DEFAULT 0,
-                        status TEXT NOT NULL,
-                        reason TEXT,
-                        risk_score INT NOT NULL DEFAULT 0,
-                        tx_lat REAL,
-                        tx_lon REAL
-                    );
-                    '''
-                )
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id SERIAL PRIMARY KEY,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    sender_account TEXT NOT NULL,
+                    recipient_account TEXT NOT NULL,
+                    amount REAL NOT NULL CHECK (amount > 0),
+                    distance_from_home REAL NOT NULL DEFAULT 0,
+                    used_pin_number INT NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    reason TEXT,
+                    risk_score INT NOT NULL DEFAULT 0,
+                    tx_lat REAL,
+                    tx_lon REAL
+                );
+                '''
+            )
+            cursor.close()
             conn.commit()
         else:
             # Local SQLite Schema Initialization
